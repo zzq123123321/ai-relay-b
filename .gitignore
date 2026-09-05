@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+data/*.log
+data/tasks.json
+*.egg-info/
