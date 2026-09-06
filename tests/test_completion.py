@@ -666,8 +666,10 @@ def test_unanswered_question_times_out_instead_of_failing_or_guessing():
 
 
 def test_pending_permission_tool_part_keeps_waiting():
-    """Real OpenCode shape for a permission prompt is a pending TOOL part
-    (state.status == 'pending'), not a separate 'permission' part."""
+    """A pending TOOL part is treated as a CANDIDATE waiting signal (the
+    real permission-popup flow is not verified on this stack; the relay
+    keeps waiting and prompts the operator instead of claiming an approval
+    path was validated)."""
     fake = ScriptedOpenChamber()
     fake.status_timeline = ["busy", "idle", "idle", "busy", "idle"]
     pending_round = [

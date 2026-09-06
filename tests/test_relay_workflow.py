@@ -323,6 +323,59 @@ def test_model_mismatch_reported_in_outcome(tmp_path):
     assert "不一致" in wf.outcome.note
 
 
+def test_request_resolved_actual_mismatch_keeps_note(tmp_path):
+    """Request A / resolved B / actual B is its own independent mismatch
+    (requested != resolved).  Even when actual equals resolved the note must
+    stay, and model_info must carry all three layers.  Choosing the saved
+    task in the registry must restore these details."""
+    oc = scripted_oc()
+    requested = ModelRef("provA", "modelA")
+    resolved = ModelRef("provB", "modelB")
+    oc.send_dispatch = make_dispatch(
+        session_id="ses_test123",
+        directory="D:/proj",
+        requested=requested,
+        resolved=resolved,
+    )
+    oc.message_timelines = [
+        [
+            user_message("u_new", "task body", 1000),
+            assistant_message(
+                "a_new", 1100, completed=1200, finish="stop",
+                parts=[text_part("final answer")], model=resolved,
+                parent_id="u_new",
+            ),
+        ]
+    ]
+    settings = RelaySettings(
+        default_target=TARGET_REASONIX,
+        openchamber_directory="D:/proj",
+        openchamber_model="provA/modelA",
+        completion_timeout=5.0,
+        poll_interval=0.01,
+    )
+    wf = make_workflow(tmp_path, oc=oc, settings=settings)
+    wf.process(v1_task(TARGET_OPENCHAMBER, "do it"))
+
+    assert wf.outcome is not None
+    assert wf.outcome.note is not None
+    assert "模型不一致" in wf.outcome.note
+    assert "provA/modelA" in wf.outcome.note
+    assert "provB/modelB" in wf.outcome.note
+    assert wf.outcome.model_info is not None
+    assert "请求 provA/modelA" in wf.outcome.model_info
+    assert "解析 provB/modelB" in wf.outcome.model_info
+    assert "实际 provB/modelB" in wf.outcome.model_info
+
+    record = wf.registry.record(wf.outcome.task_id)
+    assert record is not None
+    assert record["requested_model"] == "provA/modelA"
+    assert record["resolved_model"] == "provB/modelB"
+    assert record["actual_model"] == "provB/modelB"
+    assert record["model_note"] is not None
+    assert "不一致" in record["model_note"]
+
+
 def test_missing_directory_fails_clearly(tmp_path):
     oc = scripted_oc()
     settings = RelaySettings(default_target=TARGET_REASONIX, openchamber_directory="  ")

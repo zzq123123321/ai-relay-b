@@ -49,6 +49,8 @@ class TaskOutcome:
     is persisted, and is kept after failure so the UI can open the session
     of the task that is currently running or just failed.  ``outcome`` is
     the LAST SUCCESS reply reference, kept separately for repeat copy.
+    ``model_info`` carries the three-layer model detail (requested /
+    resolved / actual) when an OpenChamber task completed.
     """
 
     task_id: str
@@ -56,6 +58,42 @@ class TaskOutcome:
     session_id: str | None = None
     directory: str | None = None
     note: str | None = None
+    model_info: str | None = None
+
+
+def model_details(
+    requested: ModelRef | None,
+    resolved: ModelRef | None,
+    actual: ModelRef | None,
+) -> tuple[str | None, str]:
+    """Compute model detail display and the mismatch note.
+
+    Two INDEPENDENT mismatch conditions are distinguished:
+    * requested != resolved (the provider resolved to a different model
+      than the one asked for);
+    * resolved != actual (the message the model actually ran on differs
+      from the resolved model).
+
+    Missing values are shown as 未指定 (requested/resolved) or 未知
+    (actual), never guessed.  Returns ``(note, info)`` where ``info``
+    always shows the three layers and ``note`` is the "模型不一致：…"
+    prefix when at least one condition holds.
+    """
+    requested_label = requested.label() if requested is not None else "未指定"
+    resolved_label = resolved.label() if resolved is not None else "未指定"
+    actual_label = actual.label() if actual is not None else "未知"
+    info = f"请求 {requested_label}，解析 {resolved_label}，实际 {actual_label}"
+    mismatch = (
+        requested is not None
+        and resolved is not None
+        and requested != resolved
+    ) or (
+        resolved is not None
+        and actual is not None
+        and resolved != actual
+    )
+    note = f"模型不一致：{info}" if mismatch else None
+    return note, info
 
 
 class RelayWorkflow:
@@ -244,14 +282,11 @@ class RelayWorkflow:
                 self.settings.poll_interval,
                 status_callback=update,
             )
-            if result.model_mismatch:
-                actual = result.actual_model.label() if result.actual_model else "未知"
-                expected = (
-                    (result.resolved_model or result.requested_model).label()
-                    if (result.resolved_model or result.requested_model)
-                    else "未指定"
-                )
-                update(f"警告：实际执行模型 {actual} 与解析模型 {expected} 不一致")
+            note, _info = model_details(
+                result.requested_model, result.resolved_model, result.actual_model
+            )
+            if note:
+                update(f"警告：{note}")
 
             update("正在包装 OpenChamber 回复")
             response = wrap_response(
@@ -262,15 +297,9 @@ class RelayWorkflow:
                 message.max_rounds,
             )
             reply_file = self.save_reply(message.message_id, response)
-            note = None
-            if result.model_mismatch:
-                actual = result.actual_model.label() if result.actual_model else "未知"
-                expected = (
-                    (result.resolved_model or result.requested_model).label()
-                    if (result.resolved_model or result.requested_model)
-                    else "未指定"
-                )
-                note = f"模型不一致：实际 {actual}，请求/解析 {expected}"
+            note, model_info = model_details(
+                result.requested_model, result.resolved_model, result.actual_model
+            )
             self.registry.mark(
                 message.message_id,
                 "COMPLETED",
@@ -301,6 +330,7 @@ class RelayWorkflow:
                 session_id=session_id,
                 directory=directory,
                 note=note,
+                model_info=model_info,
             )
             self.current_session = self.outcome
             return response

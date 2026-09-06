@@ -39,10 +39,13 @@ OpenCode 1.18.29 (live probes, 2026-09-06):
   are real-stack markers for injected/internal text and are not answers.
 * A model question is a tool part ``{"type": "tool", "tool": "question",
   "state": {"status": "pending"}}``; it completes (status ``completed``)
-  only after the user answers in the OpenChamber UI.  Permission prompts are
-  the same real shape: ANY pending tool part (``state.status == "pending"``)
-  means the round is blocked on the operator; this is detected both while
-  the session reports ``busy`` and while it is ``idle``.
+  only after the user answers in the OpenChamber UI.  OTHER pending
+  tool/permission parts are treated as the same CANDIDATE waiting signal —
+  the relay keeps waiting and prompts the operator instead of failing.  The
+  real permission-popup flow is NOT verified on this stack, so no claim is
+  made that the permission path is validated.  This pending detection runs
+  both while the session reports ``busy``/``retry`` and while it is
+  ``idle``.
 
 The desktop deep link ``openchamber://session/<id>`` only asks the OS to
 open the session; it does not prove the window displayed it.
@@ -394,8 +397,8 @@ class OpenChamberClient:
         directory: str,
         dispatch: OpenChamberDispatch,
     ) -> bool:
-        """True when this dispatch round is currently blocked on a question
-        or permission request.
+        """True when this round currently shows a candidate pending
+        question/permission tool part.
 
         Used while the session reports ``busy``/``retry`` so the wait
         detects pending interactions instead of only reporting busy.  Any
@@ -677,15 +680,15 @@ def _parts(message: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 
 def has_pending_user_action(round_messages: Sequence[Mapping[str, Any]]) -> bool:
-    """True while the round is blocked on a question or permission request.
+    """True while the round shows a candidate pending question/permission.
 
     A pending model question is a tool part ``{"type": "tool",
-    "tool": "question", "state": {"status": "pending"}}`` (observed on the
-    local 1.22.2/1.18.29 stack); permission prompts use the SAME real
-    shape — any pending TOOL part (``state.status == "pending"``) means the
-    round is waiting for the operator's answer/approval, while a running
-    tool reports ``running``.  Pending parts in ANY message of the round
-    count: while one is pending the session is waiting for the operator.
+    "tool": "question", "state": {"status": "pending"}}`` (observed on this
+    stack).  OTHER pending TOOL / PERMISSION parts are treated as the same
+    CANDIDATE waiting signal: the relay keeps waiting and prompts the
+    operator instead of failing.  The real permission-popup flow is not
+    verified on this stack, so no claim is made that the permission path
+    was validated.
     """
     for message in round_messages:
         for part in _parts(message):
@@ -700,8 +703,9 @@ def has_pending_user_action(round_messages: Sequence[Mapping[str, Any]]) -> bool
 def pending_user_action_prompt(session_id: str) -> str:
     return (
         "请在 OpenChamber 中处理：会话 "
-        f"{session_id} 有未回答的问题或权限请求；"
-        "处理完成后中继将自动继续并回传"
+        f"{session_id} 显示待处理的问题或权限提示"
+        "（候选状态，真实权限流程待验证）；"
+        "处理后中继将自动继续并回传"
     )
 
 
@@ -765,17 +769,20 @@ def wait_for_completion(
     message is completed (``time.completed`` is a positive integer
     timestamp — 0, negative values and booleans are rejected, no
     ``info.error``), its
-    ``finish`` is ``stop``, no question/permission part is pending, and a
-    non-empty final text exists.  Truncation (``finish == length``) and
-    errors are reported as failures, never wrapped as success.
+    ``finish`` is ``stop``, no candidate pending tool/permission part
+    exists, and a non-empty final text exists.  Truncation
+    (``finish == length``) and errors are reported as failures, never
+    wrapped as success.
 
-    While the round is blocked on a question or permission request the
-    relay keeps waiting (reporting "请在 OpenChamber 中处理") instead of
-    failing: it never answers, approves or re-sends anything.  This pending
-    state is detected BOTH while the session reports busy/retry AND while
-    it is idle — the round is left running and the operator is prompted
-    until the interaction is answered.  Only the overall deadline stops the
-    relay; the session is kept and the backend keeps running.
+    While the round shows a candidate pending question/permission the relay
+    keeps waiting (reporting "请在 OpenChamber 中处理") instead of failing:
+    it never answers, approves or re-sends anything.  This candidate state
+    is detected BOTH while the session reports busy/retry AND while it is
+    idle — the round is left running and the operator is prompted until the
+    interaction goes away.  The real permission-popup flow is not verified
+    on this stack; the pending signal is a candidacy hint, not a claim that
+    approvals were validated.  Only the overall deadline stops the relay;
+    the session is kept and the backend keeps running.
     """
     update = status_callback or (lambda _status: None)
     deadline = time.monotonic() + timeout

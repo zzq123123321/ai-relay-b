@@ -44,6 +44,22 @@ logging.basicConfig(
 LOGGER = logging.getLogger("ai_relay_b")
 
 
+def _model_info_text(record: dict) -> str:
+    """Three-layer model detail restored from a registry record; missing
+    values are shown as 未指定 (requested/resolved) or 未知 (actual)."""
+    requested = record.get("requested_model")
+    resolved = record.get("resolved_model")
+    actual = record.get("actual_model")
+    note = record.get("model_note")
+    if note:
+        return note
+    return (
+        f"请求 {requested or '未指定'}，"
+        f"解析 {resolved or '未指定'}，"
+        f"实际 {actual or '未知'}"
+    )
+
+
 class WorkerSignals(QObject):
     status = Signal(str)
     succeeded = Signal(str)
@@ -252,7 +268,7 @@ class RelayWindow(QMainWindow):
         LOGGER.info("task completed response_length=%d", len(response))
         self._last_response = response
         self._last_outcome = self._workflow.outcome
-        self._refresh_saved_tasks()
+        self._refresh_saved_tasks(select_newest=True)
         self._listener.write_response(response)
 
         detail = "已将包装后的回复写入剪贴板。"
@@ -262,6 +278,8 @@ class RelayWindow(QMainWindow):
                 detail += f"（执行端 OpenChamber，会话 {outcome.session_id}）"
             if outcome.note:
                 detail += f" {outcome.note}"
+            elif outcome.model_info:
+                detail += f" {outcome.model_info}"
         self.detail_label.setText(detail)
         self._finish_task("完成：等待下一个任务")
 
@@ -346,36 +364,61 @@ class RelayWindow(QMainWindow):
 
     @Slot(int)
     def _saved_task_selected(self, _index: int):
-        if not self._busy:
-            self._set_controls_enabled(True)
+        if self._busy:
+            return
+        self._set_controls_enabled(True)
+        task_id = self._saved_task_combo.currentData()
+        if task_id:
+            record = self._workflow.registry.record(task_id)
+            if record is not None:
+                self.detail_label.setText(
+                    f"已保存任务 {task_id[:12]}…；"
+                    f"{_model_info_text(record)}"
+                )
 
     @Slot()
     def _recopy_reply(self):
-        response = self._last_response
-        selected = (
-            self._saved_task_combo.currentData()
-            if self._saved_task_combo.count()
-            else None
-        )
-        if response is None and selected:
+        selected = self._saved_task_combo.currentData()
+        if selected:
+            # an explicit selection is authoritative: read THAT task's
+            # reply, never another task's and never the last response.
             response = self._workflow.load_reply(selected)
-        if response is None and self._last_outcome is not None:
-            response = self._workflow.load_reply(self._last_outcome.task_id)
-        if response is None:
-            self._show_error("没有可重新复制的回复")
-            return
+            if response is None:
+                self._show_error(
+                    f"所选任务 {selected[:12]}… 的回复文件缺失或读取失败，"
+                    "无法复制；不会回退为其他任务的回复"
+                )
+                return
+            copied = f"（已保存任务 {selected[:12]}…）"
+        else:
+            # no selection: only the clearly identified last success reply
+            response = self._last_response
+            if response is None and self._last_outcome is not None:
+                response = self._workflow.load_reply(self._last_outcome.task_id)
+            if response is None:
+                self._show_error("没有可重新复制的回复")
+                return
+            copied = "（上次成功任务）"
         self._listener.write_response(response)
-        self.detail_label.setText("已重新复制上次回复到剪贴板（未重复执行任务）。")
+        self.detail_label.setText(
+            f"已重新复制回复到剪贴板{copied}（未重复执行任务）。"
+        )
         self._set_status("已重新复制回复")
 
-    def _refresh_saved_tasks(self):
+    def _refresh_saved_tasks(self, select_newest: bool = False):
         self._saved_task_combo.blockSignals(True)
         self._saved_task_combo.clear()
-        for record in self._workflow.registry.completed_records():
+        self._saved_task_combo.addItem("— 选择已保存任务 —", None)
+        records = self._workflow.registry.completed_records()
+        for record in records:
             self._saved_task_combo.addItem(
                 f"{record['task_id'][:12]}（{record.get('executor', '?')}）",
                 record["task_id"],
             )
+        if select_newest and records:
+            self._saved_task_combo.setCurrentIndex(len(records))
+        else:
+            self._saved_task_combo.setCurrentIndex(0)
         self._saved_task_combo.blockSignals(False)
 
     # ------------------------------------------------------------------ #
@@ -418,7 +461,7 @@ class RelayWindow(QMainWindow):
             )
             self.recopy_button.setEnabled(
                 self._last_response is not None
-                or self._saved_task_combo.count() > 0
+                or self._saved_task_combo.count() > 1
                 or self._last_outcome is not None
             )
 

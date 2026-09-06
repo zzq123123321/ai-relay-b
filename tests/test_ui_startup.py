@@ -21,25 +21,34 @@ class FailingReasonix:
         raise RuntimeError("Reasonix window was not found")
 
 
-def build_window(qapp, monkeypatch, tmp_path, reasonix_cls=FakeReasonix):
+def build_window(
+    qapp,
+    monkeypatch,
+    tmp_path,
+    reasonix_cls=FakeReasonix,
+    settings=None,
+    openchamber=None,
+):
     import ui as ui_mod
     from core.relay import RelayWorkflow as BaseRelayWorkflow
+
+    def effective_settings():
+        return settings or RelaySettings(openchamber_directory="D:/proj")
 
     class TestWorkflow(BaseRelayWorkflow):
         def __init__(self, reasonix, settings=None):
             super().__init__(
                 reasonix,
                 registry=TaskRegistry(tmp_path / "tasks.json"),
-                settings=settings
-                or RelaySettings(openchamber_directory="D:/proj"),
-                openchamber=None,
+                settings=effective_settings(),
+                openchamber=openchamber,
                 replies_dir=tmp_path / "replies",
             )
 
     class FakeSettingsType:
         @staticmethod
         def load(path=None):
-            return RelaySettings(openchamber_directory="D:/proj")
+            return effective_settings()
 
     monkeypatch.setattr(ui_mod, "ReasonixAutomation", reasonix_cls)
     monkeypatch.setattr(ui_mod, "RelayWorkflow", TestWorkflow)
@@ -201,8 +210,9 @@ def test_starting_new_task_clears_current_session(qapp, monkeypatch, tmp_path):
 
 
 def test_recopy_reply_after_restart_uses_saved_registry(qapp, monkeypatch, tmp_path):
-    """After a restart (no in-memory response) the saved completed task's
-    reply can still be re-copied from the persisted registry."""
+    """After a restart (no in-memory response) a saved completed task's
+    reply can still be re-copied from the persisted registry by selecting
+    it in the dropdown."""
     window = build_window(qapp, monkeypatch, tmp_path)
     try:
         clipboard = qapp.clipboard()
@@ -219,12 +229,174 @@ def test_recopy_reply_after_restart_uses_saved_registry(qapp, monkeypatch, tmp_p
 
     window2 = build_window(qapp, monkeypatch, tmp_path)
     try:
-        assert window2._saved_task_combo.count() >= 1
+        combo = window2._saved_task_combo
+        assert combo.findData("task-persist-001") >= 0
         clipboard = qapp.clipboard()
         clipboard.setText("")
-        window2._saved_task_combo.setCurrentIndex(0)
+        combo.setCurrentIndex(combo.findData("task-persist-001"))
         window2._recopy_reply()
         assert "hello persisted" in clipboard.text()
     finally:
         window2._listener.pause()
         window2.close()
+
+
+def _complete_task(window, qapp, body: str, task_id: str):
+    clipboard = qapp.clipboard()
+    clipboard.setText(v1_task("REASONIX", body, task_id))
+    window._on_clipboard_text(clipboard.text())
+
+    def done():
+        return f"reasonix-reply: {body}" in clipboard.text()
+
+    assert wait_until(done)
+
+
+def test_recopy_uses_selected_task_not_last_response(qapp, monkeypatch, tmp_path):
+    """Recopy must use the CURRENT drop-down selection.  After A and B both
+    completed, selecting A copies A even though B is the last response;
+    selecting B copies B."""
+    window = build_window(qapp, monkeypatch, tmp_path)
+    try:
+        _complete_task(window, qapp, "A", "task-a")
+        _complete_task(window, qapp, "B", "task-b")
+
+        combo = window._saved_task_combo
+        # the newest completed task is selected automatically; override to A
+        combo.setCurrentIndex(combo.findData("task-a"))
+        clipboard = qapp.clipboard()
+        clipboard.setText("")
+        window._recopy_reply()
+        assert "reasonix-reply: A" in clipboard.text()
+
+        combo.setCurrentIndex(combo.findData("task-b"))
+        clipboard.setText("")
+        window._recopy_reply()
+        assert "reasonix-reply: B" in clipboard.text()
+    finally:
+        window._listener.pause()
+        window.close()
+
+
+def test_recopy_after_restart_selects_saved_a(qapp, monkeypatch, tmp_path):
+    """After a restart, selecting saved task A still recopies A's reply."""
+    window = build_window(qapp, monkeypatch, tmp_path)
+    try:
+        _complete_task(window, qapp, "A", "task-a")
+        _complete_task(window, qapp, "B", "task-b")
+    finally:
+        window._listener.pause()
+        window.close()
+
+    window2 = build_window(qapp, monkeypatch, tmp_path)
+    try:
+        combo = window2._saved_task_combo
+        clipboard = qapp.clipboard()
+        clipboard.setText("")
+        combo.setCurrentIndex(combo.findData("task-a"))
+        window2._recopy_reply()
+        assert "reasonix-reply: A" in clipboard.text()
+    finally:
+        window2._listener.pause()
+        window2.close()
+
+
+def test_recopy_selected_reply_missing_does_not_fallback(qapp, monkeypatch, tmp_path):
+    """When the selected task's reply file is missing, recopy must FAIL with
+    a clear error and must NOT fall back to copying another task's reply."""
+    window = build_window(qapp, monkeypatch, tmp_path)
+    try:
+        _complete_task(window, qapp, "A", "task-a")
+        _complete_task(window, qapp, "B", "task-b")
+
+        # remove A's reply file only
+        reply_a = window._workflow.reply_file_for("task-a")
+        assert reply_a.exists()
+        reply_a.unlink()
+
+        combo = window._saved_task_combo
+        combo.setCurrentIndex(combo.findData("task-a"))
+        clipboard = qapp.clipboard()
+        clipboard.setText("")
+        window._recopy_reply()
+        assert "回复文件缺失" in window.detail_label.text()
+        # B's reply must NOT have been copied (no fallback)
+        assert "reasonix-reply: B" not in clipboard.text()
+    finally:
+        window._listener.pause()
+        window.close()
+
+
+def test_model_details_three_layers_shown_in_ui(qapp, monkeypatch, tmp_path):
+    """Requested A / resolved B / actual B must keep a '模型不一致' note and
+    show the three layers in the completion detail; selecting the saved
+    task restores the details from the registry record."""
+    import ui as ui_mod
+
+    from core.openchamber import ModelRef
+    from core.relay_settings import TARGET_OPENCHAMBER, RelaySettings
+    from tests.fakes import (
+        ScriptedOpenChamber,
+        assistant_message,
+        make_dispatch,
+        text_part,
+        user_message,
+    )
+
+    requested = ModelRef("provA", "modelA")
+    resolved = ModelRef("provB", "modelB")
+    oc = ScriptedOpenChamber()
+    oc.send_dispatch = make_dispatch(
+        session_id="ses_test123",
+        directory="D:/proj",
+        requested=requested,
+        resolved=resolved,
+    )
+    oc.message_timelines = [
+        [
+            user_message("u_new", "task body", 1000),
+            assistant_message(
+                "a_new", 1100, completed=1200, finish="stop",
+                parts=[text_part("final answer")], model=resolved,
+                parent_id="u_new",
+            ),
+        ]
+    ]
+    settings = RelaySettings(
+        default_target=TARGET_OPENCHAMBER,
+        openchamber_directory="D:/proj",
+        openchamber_model="provA/modelA",
+        completion_timeout=5.0,
+        poll_interval=0.01,
+    )
+    window = build_window(
+        qapp, monkeypatch, tmp_path, settings=settings, openchamber=oc
+    )
+    window._startup_check_pending = False
+    try:
+        clipboard = qapp.clipboard()
+        clipboard.setText(v1_task("OPENCHAMBER", "do it", "task-model-ui"))
+        window._on_clipboard_text(clipboard.text())
+
+        def done():
+            return "IN_REPLY_TO: task-model-ui" in clipboard.text()
+
+        assert wait_until(done)
+        # completion detail carries the mismatch note with all three layers
+        text = window.detail_label.text()
+        assert "模型不一致" in text
+        assert "provA/modelA" in text
+        assert "provB/modelB" in text
+
+        # selecting the saved task restores the details from the registry
+        combo = window._saved_task_combo
+        combo.setCurrentIndex(0)  # placeholder
+        combo.setCurrentIndex(combo.findData("task-model-ui"))
+        restored = window.detail_label.text()
+        assert "已保存任务" in restored
+        assert "模型不一致" in restored
+        assert "provA/modelA" in restored
+        assert "provB/modelB" in restored
+    finally:
+        window._listener.pause()
+        window.close()
