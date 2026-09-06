@@ -4,4 +4,6 @@ build/
 dist/
 data/*.log
 data/tasks.json
+data/replies/
+data/relay_settings.json
 *.egg-info/

@@ -172,10 +172,6 @@ def question_part(status: str = "pending") -> dict:
     return {"type": "tool", "tool": "question", "state": state}
 
 
-def permission_part(status: str = "pending") -> dict:
-    return {"type": "permission", "permission": "bash", "state": {"status": status}}
-
-
 class ScriptedOpenChamber:
     """OpenChamberClient stand-in with a scripted status/message timeline."""
 
@@ -192,6 +188,7 @@ class ScriptedOpenChamber:
         self.send_dispatch: OpenChamberDispatch | None = None
         self.send_error: Exception | None = None
         self.unavailable: bool = False
+        self.messages_read = 0
 
     # -- recording helpers ------------------------------------------------
 
@@ -237,6 +234,7 @@ class ScriptedOpenChamber:
     def messages(self, session_id: str, directory: str) -> list[dict]:
         if self.unavailable:
             raise OpenChamberUnavailableError("unavailable")
+        self.messages_read += 1
         if not self.message_timelines:
             return []
         index = min(self._message_index, len(self.message_timelines) - 1)
@@ -245,6 +243,25 @@ class ScriptedOpenChamber:
 
     def advance_messages(self) -> None:
         self._message_index += 1
+
+    def round_has_pending_user_action(
+        self, session_id: str, directory: str, dispatch: OpenChamberDispatch
+    ) -> bool:
+        """Faithful busy-period pending check: reads the current session
+        messages (same as the real client) and scans for any pending
+        tool/permission part."""
+        try:
+            messages = self.messages(session_id, directory)
+        except OpenChamberUnavailableError:
+            return False
+        for message in messages:
+            for part in message.get("parts") or []:
+                if part.get("type") not in ("tool", "permission"):
+                    continue
+                state = part.get("state")
+                if isinstance(state, dict) and state.get("status") == "pending":
+                    return True
+        return False
 
     def close(self) -> None:
         pass

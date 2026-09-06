@@ -7,6 +7,7 @@ import time
 import pytest
 
 from core.protocol import ProtocolFormat, parse_message
+from core.relay import TaskOutcome
 from core.relay_settings import RelaySettings
 from core.task_registry import TaskRegistry
 from tests.test_relay_workflow import FakeReasonix, v1_task
@@ -22,8 +23,9 @@ class FailingReasonix:
 
 def build_window(qapp, monkeypatch, tmp_path, reasonix_cls=FakeReasonix):
     import ui as ui_mod
+    from core.relay import RelayWorkflow as BaseRelayWorkflow
 
-    class TestWorkflow(ui_mod.RelayWorkflow):
+    class TestWorkflow(BaseRelayWorkflow):
         def __init__(self, reasonix, settings=None):
             super().__init__(
                 reasonix,
@@ -133,3 +135,96 @@ def test_response_message_on_clipboard_is_not_processed(qapp, monkeypatch, tmp_p
     finally:
         window._listener.pause()
         window.close()
+
+
+def test_open_session_tracks_current_task_not_last_success(qapp, monkeypatch, tmp_path):
+    """The 'open current session' action uses the task which owns this
+    moment's session, never the last successful reply; it stays usable
+    after the task fails."""
+    import ui as ui_mod
+
+    window = build_window(qapp, monkeypatch, tmp_path)
+    window._startup_check_pending = False
+    opened: list[str] = []
+    monkeypatch.setattr(
+        ui_mod.OpenChamberClient,
+        "open_session",
+        lambda self, session_id: opened.append(session_id),
+    )
+    try:
+        # a previous task succeeded (session A) but the current live one is B
+        window._last_outcome = TaskOutcome(
+            "task-A", "OPENCHAMBER", "ses_A", "D:/proj"
+        )
+        window._current_outcome = TaskOutcome(
+            "task-B", "OPENCHAMBER", "ses_B", "D:/proj"
+        )
+        window._open_current_session()
+        assert opened == ["ses_B"]  # never task A while B is current
+
+        # after a failure the current session must still be openable
+        window._task_failed("timeout")
+        assert window.open_session_button.isEnabled()
+        window._open_current_session()
+        assert opened == ["ses_B", "ses_B"]
+    finally:
+        window._listener.pause()
+        window.close()
+
+
+def test_starting_new_task_clears_current_session(qapp, monkeypatch, tmp_path):
+    """Accepting task B must clear task A's session so the button cannot
+    open task A while B is in progress."""
+    window = build_window(qapp, monkeypatch, tmp_path)
+    window._startup_check_pending = False
+    try:
+        window._current_outcome = TaskOutcome(
+            "task-A", "OPENCHAMBER", "ses_A", "D:/proj"
+        )
+        window.open_session_button.setEnabled(True)
+
+        clipboard = qapp.clipboard()
+        clipboard.setText(v1_task("REASONIX", "say hi", "task-ui-clear-001"))
+        window._on_clipboard_text(clipboard.text())
+        assert window._current_outcome is None
+        assert not window.open_session_button.isEnabled()
+
+        def finished():
+            return "IN_REPLY_TO: task-ui-clear-001" in clipboard.text()
+
+        assert wait_until(finished)
+        # a REASONIX task has no OpenChamber session to open
+        assert not window.open_session_button.isEnabled()
+    finally:
+        window._listener.pause()
+        window.close()
+
+
+def test_recopy_reply_after_restart_uses_saved_registry(qapp, monkeypatch, tmp_path):
+    """After a restart (no in-memory response) the saved completed task's
+    reply can still be re-copied from the persisted registry."""
+    window = build_window(qapp, monkeypatch, tmp_path)
+    try:
+        clipboard = qapp.clipboard()
+        clipboard.setText(v1_task("REASONIX", "hello persisted", "task-persist-001"))
+        window._on_clipboard_text(clipboard.text())
+
+        def done():
+            return "IN_REPLY_TO: task-persist-001" in clipboard.text()
+
+        assert wait_until(done)
+    finally:
+        window._listener.pause()
+        window.close()
+
+    window2 = build_window(qapp, monkeypatch, tmp_path)
+    try:
+        assert window2._saved_task_combo.count() >= 1
+        clipboard = qapp.clipboard()
+        clipboard.setText("")
+        window2._saved_task_combo.setCurrentIndex(0)
+        window2._recopy_reply()
+        assert "hello persisted" in clipboard.text()
+    finally:
+        window2._listener.pause()
+        window2.close()

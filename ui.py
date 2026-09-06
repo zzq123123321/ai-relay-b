@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -47,6 +48,7 @@ class WorkerSignals(QObject):
     status = Signal(str)
     succeeded = Signal(str)
     failed = Signal(str)
+    session_started = Signal(object)
 
 
 class RelayTask(QRunnable):
@@ -59,7 +61,11 @@ class RelayTask(QRunnable):
     @Slot()
     def run(self):
         try:
-            result = self.workflow.process(self.text, self.signals.status.emit)
+            result = self.workflow.process(
+                self.text,
+                self.signals.status.emit,
+                self.signals.session_started.emit,
+            )
             self.signals.succeeded.emit(result)
         except Exception as exc:
             self.signals.failed.emit(str(exc))
@@ -99,6 +105,7 @@ class RelayWindow(QMainWindow):
         )
         self._last_response: str | None = None
         self._last_outcome: TaskOutcome | None = None
+        self._current_outcome: TaskOutcome | None = None
         self._listener = ClipboardListener(app.clipboard())
         self._listener.task_received.connect(self._on_clipboard_text)
 
@@ -113,9 +120,12 @@ class RelayWindow(QMainWindow):
         self.check_button = QPushButton("测试 Reasonix 连接")
         self.open_session_button = QPushButton("打开当前会话")
         self.recopy_button = QPushButton("重新复制回复")
+        self._saved_task_combo = QComboBox()
+        self._saved_task_combo.setMinimumWidth(200)
         self.pause_button.setEnabled(False)
         self.open_session_button.setEnabled(False)
         self.recopy_button.setEnabled(False)
+        self._refresh_saved_tasks()
 
         layout = QVBoxLayout()
         layout.addWidget(self.status_label)
@@ -125,7 +135,10 @@ class RelayWindow(QMainWindow):
         layout.addWidget(self.check_button)
         layout.addWidget(self._build_settings_group())
         row1 = self._button_row(self.open_session_button)
-        row2 = self._button_row(self.recopy_button)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("已保存任务"))
+        row2.addWidget(self._saved_task_combo)
+        row2.addWidget(self.recopy_button)
         layout.addLayout(row1)
         layout.addLayout(row2)
 
@@ -138,6 +151,7 @@ class RelayWindow(QMainWindow):
         self.check_button.clicked.connect(self._self_check)
         self.open_session_button.clicked.connect(self._open_current_session)
         self.recopy_button.clicked.connect(self._recopy_reply)
+        self._saved_task_combo.currentIndexChanged.connect(self._saved_task_selected)
         self._save_settings_button.clicked.connect(self._save_settings)
 
         QTimer.singleShot(0, self._self_check)
@@ -219,12 +233,14 @@ class RelayWindow(QMainWindow):
             return
 
         self._busy = True
+        self._current_outcome = None
         self._set_controls_enabled(False)
 
         task = RelayTask(self._workflow, text)
         task.signals.status.connect(self._set_status)
         task.signals.succeeded.connect(self._task_succeeded)
         task.signals.failed.connect(self._task_failed)
+        task.signals.session_started.connect(self._on_session_started)
         self._pool.start(task)
 
     # ------------------------------------------------------------------ #
@@ -236,6 +252,7 @@ class RelayWindow(QMainWindow):
         LOGGER.info("task completed response_length=%d", len(response))
         self._last_response = response
         self._last_outcome = self._workflow.outcome
+        self._refresh_saved_tasks()
         self._listener.write_response(response)
 
         detail = "已将包装后的回复写入剪贴板。"
@@ -246,10 +263,6 @@ class RelayWindow(QMainWindow):
             if outcome.note:
                 detail += f" {outcome.note}"
         self.detail_label.setText(detail)
-        self.open_session_button.setEnabled(
-            outcome is not None and outcome.session_id is not None
-        )
-        self.recopy_button.setEnabled(True)
         self._finish_task("完成：等待下一个任务")
 
     @Slot(str)
@@ -305,9 +318,16 @@ class RelayWindow(QMainWindow):
     # session / reply actions
     # ------------------------------------------------------------------ #
 
+    @Slot(object)
+    def _on_session_started(self, outcome: TaskOutcome):
+        self._current_outcome = outcome
+        # The open-session button targets THIS task from the moment its
+        # session exists and is persisted, even while it is still running.
+        self.open_session_button.setEnabled(True)
+
     @Slot()
     def _open_current_session(self):
-        outcome = self._last_outcome or self._workflow.outcome
+        outcome = self._current_outcome
         if outcome is None or not outcome.session_id:
             self._show_error("当前没有可打开的 OpenChamber 会话")
             return
@@ -324,9 +344,21 @@ class RelayWindow(QMainWindow):
         )
         self._set_status("已请求打开 OpenChamber 会话")
 
+    @Slot(int)
+    def _saved_task_selected(self, _index: int):
+        if not self._busy:
+            self._set_controls_enabled(True)
+
     @Slot()
     def _recopy_reply(self):
         response = self._last_response
+        selected = (
+            self._saved_task_combo.currentData()
+            if self._saved_task_combo.count()
+            else None
+        )
+        if response is None and selected:
+            response = self._workflow.load_reply(selected)
         if response is None and self._last_outcome is not None:
             response = self._workflow.load_reply(self._last_outcome.task_id)
         if response is None:
@@ -335,6 +367,16 @@ class RelayWindow(QMainWindow):
         self._listener.write_response(response)
         self.detail_label.setText("已重新复制上次回复到剪贴板（未重复执行任务）。")
         self._set_status("已重新复制回复")
+
+    def _refresh_saved_tasks(self):
+        self._saved_task_combo.blockSignals(True)
+        self._saved_task_combo.clear()
+        for record in self._workflow.registry.completed_records():
+            self._saved_task_combo.addItem(
+                f"{record['task_id'][:12]}（{record.get('executor', '?')}）",
+                record["task_id"],
+            )
+        self._saved_task_combo.blockSignals(False)
 
     # ------------------------------------------------------------------ #
     # settings
@@ -367,13 +409,18 @@ class RelayWindow(QMainWindow):
         self.pause_button.setEnabled(enabled and self._listener.enabled)
         self.check_button.setEnabled(enabled)
         self._save_settings_button.setEnabled(enabled)
+        self.open_session_button.setEnabled(False)
+        self.recopy_button.setEnabled(False)
         if enabled:
             self.open_session_button.setEnabled(
-                (self._last_outcome or self._workflow.outcome) is not None
-                and (self._last_outcome or self._workflow.outcome).session_id
-                is not None
+                self._current_outcome is not None
+                and self._current_outcome.session_id is not None
             )
-            self.recopy_button.setEnabled(self._last_response is not None)
+            self.recopy_button.setEnabled(
+                self._last_response is not None
+                or self._saved_task_combo.count() > 0
+                or self._last_outcome is not None
+            )
 
     def _set_status(self, status: str):
         now = datetime.now().strftime("%H:%M:%S")

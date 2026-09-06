@@ -17,20 +17,32 @@ OpenCode 1.18.29 (live probes, 2026-09-06):
   pre-prompt baseline user message id server-side only to verify that the
   prompt actually landed (``promptDispatched`` is false otherwise).  Round
   association must therefore use the message-id snapshot taken before the
-  send (see :class:`OpenChamberDispatch`), never a time window.
+  send (see :class:`OpenChamberDispatch`), never a time window.  If that
+  pre-send snapshot CANNOT be read, the task is NOT sent: with no
+  trustworthy snapshot the round cannot be attributed, so the prompt is
+  aborted instead of being degraded to a guess.
 * ``GET /api/session/status?directory=...`` ->
   ``{sessionId: {"type": "busy" | "retry" | ...}}``.  OpenChamber proxies
   this to OpenCode, whose ``SessionStatus.set()`` removes a session from the
   map the moment its status becomes ``idle`` (and ``get()`` falls back to
   ``{type: "idle"}`` for unknown ids).  A session id MISSING from the map
-  therefore means idle; the map only ever contains busy/retry entries.
+  therefore means idle; the map only ever contains busy/retry entries.  A
+  session id PRESENT with a null value is malformed data -> ``unknown``,
+  never idle.
 * ``GET /api/session/:id/message?directory=...`` -> message array; assistant
-  ``info`` carries ``parentID`` (the user message that triggered it),
-  ``finish`` / ``error`` / ``time.completed``.
-* A model question is a part ``{"type": "tool", "tool": "question",
+  ``info`` carries ``parentID`` (the user message that triggered the turn),
+  ``finish`` / ``error`` / ``time.completed`` / ``time.created``.  Round
+  membership is verified by walking each assistant message's ``parentID``
+  chain up to the round's user message; the round is ordered by the
+  strictly-increasing ``time.created`` timestamps, never by array position.
+  Text parts flagged ``synthetic: true`` (or whose state is ``ignored``)
+  are real-stack markers for injected/internal text and are not answers.
+* A model question is a tool part ``{"type": "tool", "tool": "question",
   "state": {"status": "pending"}}``; it completes (status ``completed``)
   only after the user answers in the OpenChamber UI.  Permission prompts are
-  likewise pending tool/permission parts.
+  the same real shape: ANY pending tool part (``state.status == "pending"``)
+  means the round is blocked on the operator; this is detected both while
+  the session reports ``busy`` and while it is ``idle``.
 
 The desktop deep link ``openchamber://session/<id>`` only asks the OS to
 open the session; it does not prove the window displayed it.
@@ -111,9 +123,10 @@ class OpenChamberDispatch:
     A user message whose id is NOT in that set is new; exactly one new user
     message is this round, more than one is ambiguous (for example the
     operator typed into the same session manually) and is reported as an
-    error instead of being guessed.  ``pre_send_snapshot_ok`` is False when
-    the pre-send snapshot request failed; the round is then located among
-    ALL user messages, which stays safe but may over-report ambiguity.
+    error instead of being guessed.  ``pre_send_snapshot_ok`` is always
+    True for a dispatch returned by :meth:`OpenChamberClient.send`: a failed
+    snapshot aborts the send, so a False value here marks an untrustworthy
+    dispatch that location must treat as ambiguous rather than guess.
     ``user_message_id`` is parsed from the send response when a build
     returns one (the local 1.22.2 build does not).
     """
@@ -255,9 +268,8 @@ class OpenChamberClient:
     def _pre_send_snapshot(self, session_id: str, directory: str) -> tuple[frozenset[str], bool]:
         """Message ids already present in the session, taken before the send.
 
-        Never fails the send: if the snapshot cannot be read, the round is
-        later located among all user messages (``pre_send_snapshot_ok``
-        False), which can only over-report ambiguity, never mis-attribute.
+        A failed snapshot abort the send: with no trustworthy snapshot the
+        round cannot be attributed, so the prompt is never dispatched.
         """
         try:
             messages = self.messages(session_id, directory)
@@ -283,6 +295,12 @@ class OpenChamberClient:
         if not prompt or not prompt.strip():
             raise OpenChamberSessionError("OpenChamber task prompt must not be empty")
         pre_ids, snapshot_ok = self._pre_send_snapshot(session_id, directory)
+        if not snapshot_ok:
+            raise OpenChamberSessionError(
+                "cannot attribute this round safely: the pre-send message "
+                f"snapshot for session {session_id} could not be read; the "
+                "task was NOT sent and the session is kept for manual check"
+            )
         body: dict[str, Any] = {"prompt": prompt, "directory": directory}
         if agent:
             body["agent"] = agent
@@ -336,20 +354,23 @@ class OpenChamberClient:
     def session_status(self, session_id: str, directory: str) -> str:
         """Return the session's status type.
 
-        ``idle`` covers both an explicit ``{"type": "idle"}`` entry and a
-        missing session id: OpenCode's SessionStatus service deletes a
-        session from the map exactly when it becomes idle (and falls back
-        to idle for unknown ids), so the map only holds busy/retry entries.
-        Anything else (unrecognized type, malformed payload) is ``unknown``
-        and must never be treated as idle or as success.
+        ``idle`` covers a MISSING session id: OpenCode's SessionStatus
+        service deletes a session from the map exactly when it becomes idle
+        (and falls back to idle for unknown ids), so the map only holds
+        busy/retry entries.  A session id PRESENT with a null value is
+        malformed data and is ``unknown``.  Anything else (unrecognized
+        type, malformed payload) is ``unknown`` and must never be treated as
+        idle or as success.
         """
         encoded = requests.utils.quote(directory, safe="")
         response = self._get_json(f"/api/session/status?directory={encoded}")
         if not isinstance(response, dict):
             return "unknown"
-        entry = response.get(session_id)
-        if entry is None:
+        if session_id not in response:
             return "idle"
+        entry = response[session_id]
+        if entry is None:
+            return "unknown"
         if isinstance(entry, str) and entry:
             return entry if entry in ("idle", "busy", "retry") else "unknown"
         if isinstance(entry, Mapping):
@@ -366,6 +387,35 @@ class OpenChamberClient:
                 f"session message response is not a list: {type(payload).__name__}"
             )
         return [item for item in payload if isinstance(item, dict)]
+
+    def round_has_pending_user_action(
+        self,
+        session_id: str,
+        directory: str,
+        dispatch: OpenChamberDispatch,
+    ) -> bool:
+        """True when this dispatch round is currently blocked on a question
+        or permission request.
+
+        Used while the session reports ``busy``/``retry`` so the wait
+        detects pending interactions instead of only reporting busy.  Any
+        interface or attribution failure returns False (the busy branch
+        just keeps waiting; it never guesses).
+        """
+        try:
+            messages = self.messages(session_id, directory)
+        except OpenChamberError:
+            return False
+        user_index, location_error = locate_round(messages, dispatch)
+        if location_error != "ok":
+            return False
+        try:
+            round_messages = _round_assistant_messages(
+                messages, user_index, _message_id(messages[user_index])
+            )
+        except OpenChamberError:
+            return False
+        return has_pending_user_action(round_messages)
 
     def close(self) -> None:
         self._http.close()
@@ -471,10 +521,10 @@ def locate_round(
 
     Attribution is by message id, not by time or position: user messages
     whose id is new relative to the pre-send snapshot are candidates;
-    exactly one is required.  Assistant messages whose ``parentID`` points
-    at a *different* user message make the attribution unprovable.  A
-    server-returned user message id (when the build provides one) takes
-    precedence over the snapshot.
+    exactly one is required.  A dispatch whose snapshot failed cannot prove
+    which user message is new and is ALWAYS ambiguous (never degraded to a
+    guess).  A server-returned user message id (when the build provides
+    one) takes precedence over the snapshot.
     """
     user_indexes = [
         index for index, message in enumerate(messages) if _role(message) == "user"
@@ -483,57 +533,140 @@ def locate_round(
     if dispatch.user_message_id:
         for index in user_indexes:
             if _message_id(messages[index]) == dispatch.user_message_id:
-                return _check_parent_chain(
-                    messages, index, dispatch.user_message_id
-                )
+                return index, "ok"
         return -1, "not_found"
 
-    if dispatch.pre_send_snapshot_ok:
-        candidates = [
-            index
-            for index in user_indexes
-            if _message_id(messages[index]) not in dispatch.pre_send_message_ids
-        ]
-    else:
-        candidates = list(user_indexes)
+    if not dispatch.pre_send_snapshot_ok:
+        return -1, "ambiguous"
 
+    candidates = [
+        index
+        for index in user_indexes
+        if _message_id(messages[index]) not in dispatch.pre_send_message_ids
+    ]
     if len(candidates) > 1:
         return -1, "ambiguous"
     if not candidates:
         return -1, "not_found"
-    return _check_parent_chain(
-        messages, candidates[0], _message_id(messages[candidates[0]])
-    )
+    return candidates[0], "ok"
 
 
-def _check_parent_chain(
-    messages: Sequence[Mapping[str, Any]], anchor_index: int, anchor_id: str | None
-) -> tuple[int, str]:
-    """Reject rounds whose assistant messages attach to another user message.
+def _message_created(message: Mapping[str, Any]) -> int | None:
+    info = message.get("info")
+    if isinstance(info, Mapping):
+        created = (info.get("time") or {}).get("created")
+        if isinstance(created, int) and not isinstance(created, bool) and created > 0:
+            return created
+    return None
 
-    Assistant messages after the anchor that carry a ``parentID`` pointing
-    at a *user* message different from the anchor cannot be part of this
-    round (history or a manually inserted message) and the round is then
-    ambiguous.  A ``parentID`` pointing at another assistant message is a
-    normal chain continuation and does not contradict the anchor.
+
+def _chain_result(
+    message: Mapping[str, Any],
+    anchor_id: str,
+    by_id: Mapping[str, Mapping[str, Any]],
+    user_ids: set[str],
+) -> str:
+    """Resolve an assistant message's ``parentID`` chain.
+
+    Returns ``"anchor"`` when the chain reaches the round's user message,
+    ``"other"`` when it verifiably terminates at a different user message
+    (history/another round -> not part of this round), or ``"unknown"``
+    when the parent is missing, unresolvable or cyclic (cannot be proven:
+    the round must fail, never include the message).
     """
-    known_user_ids = {
-        message_id
-        for message_id in (
-            _message_id(message) for message in messages if _role(message) == "user"
+    seen: set[str] = set()
+    current = _message_id(message)
+    while True:
+        if not current:
+            return "unknown"
+        if current == anchor_id:
+            return "anchor"
+        if current in user_ids:
+            return "other"
+        if current in seen:
+            return "unknown"
+        seen.add(current)
+        node = by_id.get(current)
+        if node is None:
+            return "unknown"
+        parent = _parent_id(node)
+        if not parent:
+            return "unknown"
+        current = parent
+
+
+def _round_assistant_messages(
+    messages: Sequence[Mapping[str, Any]],
+    anchor_index: int,
+    anchor_id: str | None,
+) -> list[Mapping[str, Any]]:
+    """Assistant messages that provably belong to the anchored round.
+
+    Membership is decided by the verified ``parentID`` chain, NOT by array
+    position: an assistant message is part of the round only when walking
+    its ``parentID`` chain reaches the round's user message.  History and
+    other rounds' messages chain to a different user and are excluded.
+    Messages whose chain cannot be resolved make the round ambiguous.
+    The round is returned ordered by ``time.created`` (strictly increasing
+    across turns in real data); a message without a verified created
+    timestamp or with a tie cannot be strictly ordered and the round fails.
+    """
+    if not anchor_id:
+        raise OpenChamberSessionError(
+            "cannot attribute this round without a verifiable user message "
+            "id in the session"
         )
-        if message_id
-    }
-    for index in range(anchor_index + 1, len(messages)):
-        message = messages[index]
+    by_id: dict[str, Mapping[str, Any]] = {}
+    user_ids: set[str] = set()
+    for message in messages:
+        mid = _message_id(message)
+        if mid:
+            by_id[mid] = message
+            if _role(message) == "user":
+                user_ids.add(mid)
+
+    round_messages: list[Mapping[str, Any]] = []
+    unverifiable: list[str] = []
+    for message in messages:
         if _role(message) != "assistant":
             continue
-        parent = _parent_id(message)
-        if parent is None or parent == anchor_id:
-            continue
-        if parent in known_user_ids:
-            return -1, "ambiguous"
-    return anchor_index, "ok"
+        result = _chain_result(message, anchor_id, by_id, user_ids)
+        if result == "anchor":
+            round_messages.append(message)
+        elif result == "unknown":
+            mid = _message_id(message)
+            unverifiable.append(f"message {mid} has an unverifiable parent chain")
+    if unverifiable:
+        raise OpenChamberSessionError(
+            "ambiguous: an assistant message in OpenChamber session "
+            f"({'; '.join(unverifiable)}) cannot be proven to belong to "
+            "this task round; the result was not guessed"
+        )
+    return _strictly_order_round(round_messages)
+
+
+def _strictly_order_round(
+    round_messages: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    if not round_messages:
+        return []
+    entries: list[tuple[int, Mapping[str, Any]]] = []
+    for message in round_messages:
+        created = _message_created(message)
+        if created is None:
+            raise OpenChamberSessionError(
+                "ambiguous: an assistant message of this round has no "
+                "verified created timestamp; the result was not guessed"
+            )
+        entries.append((created, message))
+    keys = [created for created, _message in entries]
+    if len(set(keys)) != len(keys):
+        raise OpenChamberSessionError(
+            "ambiguous: this round's assistant messages cannot be strictly "
+            "ordered by their verified created timestamps; the result was "
+            "not guessed"
+        )
+    return [message for _, message in sorted(entries, key=lambda item: item[0])]
 
 
 def _parts(message: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -543,59 +676,44 @@ def _parts(message: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [part for part in parts if isinstance(part, Mapping)]
 
 
-def _round_assistant_messages(
-    messages: Sequence[Mapping[str, Any]],
-    anchor_index: int,
-    anchor_id: str | None,
-) -> list[Mapping[str, Any]]:
-    """Assistant messages belonging to the anchored round.
-
-    Normally the anchor's user message precedes all assistant messages of
-    the round in the array.  If the server returns them in another order,
-    assistant messages that precede the anchor still belong to the round
-    when their ``parentID`` points at the anchor.
-    """
-    by_index: dict[int, Mapping[str, Any]] = {}
-    for index in range(anchor_index + 1, len(messages)):
-        if _role(messages[index]) == "assistant":
-            by_index[index] = messages[index]
-    if anchor_id is not None:
-        for index in range(0, anchor_index):
-            if (
-                _role(messages[index]) == "assistant"
-                and _parent_id(messages[index]) == anchor_id
-            ):
-                by_index[index] = messages[index]
-    return [by_index[index] for index in sorted(by_index)]
-
-
 def has_pending_user_action(round_messages: Sequence[Mapping[str, Any]]) -> bool:
     """True while the round is blocked on a question or permission request.
 
     A pending model question is a tool part ``{"type": "tool",
     "tool": "question", "state": {"status": "pending"}}`` (observed on the
-    local 1.22.2/1.18.29 stack); permission prompts surface the same way
-    (pending tool/permission part) and through OpenCode's permission
-    events.  Pending parts in ANY message of the round count: while one is
-    pending the session is waiting for the operator, not executing.
+    local 1.22.2/1.18.29 stack); permission prompts use the SAME real
+    shape — any pending TOOL part (``state.status == "pending"``) means the
+    round is waiting for the operator's answer/approval, while a running
+    tool reports ``running``.  Pending parts in ANY message of the round
+    count: while one is pending the session is waiting for the operator.
     """
     for message in round_messages:
         for part in _parts(message):
-            if part.get("type") == "tool" and part.get("tool") == "question":
-                state = part.get("state")
-                if isinstance(state, Mapping) and state.get("status") == "pending":
-                    return True
-            elif part.get("type") == "permission":
-                state = part.get("state")
-                if isinstance(state, Mapping) and state.get("status") == "pending":
-                    return True
+            if part.get("type") not in ("tool", "permission"):
+                continue
+            state = part.get("state")
+            if isinstance(state, Mapping) and state.get("status") == "pending":
+                return True
     return False
+
+
+def pending_user_action_prompt(session_id: str) -> str:
+    return (
+        "请在 OpenChamber 中处理：会话 "
+        f"{session_id} 有未回答的问题或权限请求；"
+        "处理完成后中继将自动继续并回传"
+    )
 
 
 def _text_parts(message: Mapping[str, Any]) -> list[str]:
     texts = []
     for part in _parts(message):
         if part.get("type") != "text":
+            continue
+        if part.get("synthetic") is True:
+            continue  # real marker for injected/internal text, not an answer
+        state = part.get("state")
+        if isinstance(state, Mapping) and state.get("status") == "ignored":
             continue
         text = part.get("text")
         if isinstance(text, str) and text.strip():
@@ -615,12 +733,18 @@ def _tool_call_names(message: Mapping[str, Any]) -> list[str]:
 
 
 def extract_final_text(round_messages: Sequence[Mapping[str, Any]]) -> str:
-    """Final assistant text of the round (index-ordered, last real text)."""
-    for message in reversed(round_messages):
-        texts = _text_parts(message)
-        if texts:
-            return "\n".join(texts).strip()
-    return ""
+    """Final assistant text of the round.
+
+    Only the LAST message of the verified order contributes text: an
+    earlier intermediate message's text is never a fallback.  Synthetic /
+    ignored text parts are excluded per real-stack semantics.  An empty
+    result means the final message genuinely carries no answer.
+    """
+    if not round_messages:
+        return ""
+    final = round_messages[-1]
+    texts = _text_parts(final)
+    return "\n".join(texts).strip()
 
 
 def wait_for_completion(
@@ -638,16 +762,20 @@ def wait_for_completion(
     service defines as idle; unrecognized status types, interface failures
     and malformed payloads are never converted into idle or success), the
     round is uniquely located by message id, the round's last assistant
-    message is completed (``time.completed`` set, no ``info.error``), its
+    message is completed (``time.completed`` is a positive integer
+    timestamp — 0, negative values and booleans are rejected, no
+    ``info.error``), its
     ``finish`` is ``stop``, no question/permission part is pending, and a
     non-empty final text exists.  Truncation (``finish == length``) and
     errors are reported as failures, never wrapped as success.
 
     While the round is blocked on a question or permission request the
     relay keeps waiting (reporting "请在 OpenChamber 中处理") instead of
-    failing: it never answers, approves or re-sends anything.  Only the
-    overall deadline stops the relay; the session is kept and the backend
-    keeps running.
+    failing: it never answers, approves or re-sends anything.  This pending
+    state is detected BOTH while the session reports busy/retry AND while
+    it is idle — the round is left running and the operator is prompted
+    until the interaction is answered.  Only the overall deadline stops the
+    relay; the session is kept and the backend keeps running.
     """
     update = status_callback or (lambda _status: None)
     deadline = time.monotonic() + timeout
@@ -684,13 +812,22 @@ def wait_for_completion(
             reply_grace_deadline = None
             incomplete_grace_deadline = None
             last_seen_message_id = None
-            saw_pending_user_action = False
-            time.sleep(min(poll_interval, max(0.1, deadline - time.monotonic())))
-            update(
-                "OpenChamber 正在执行（retry，上游重试中）…"
-                if status_type == "retry"
-                else "OpenChamber 正在执行（busy）…"
-            )
+            sleep_for = min(poll_interval, max(0.1, deadline - time.monotonic()))
+            if client.round_has_pending_user_action(
+                dispatch.session_id, dispatch.directory, dispatch
+            ):
+                # A pending question/permission is detected DURING busy/retry
+                # too: the round is waiting for the operator, not executing.
+                saw_pending_user_action = True
+                update(pending_user_action_prompt(dispatch.session_id))
+            else:
+                saw_pending_user_action = False
+                update(
+                    "OpenChamber 正在执行（retry，上游重试中）…"
+                    if status_type == "retry"
+                    else "OpenChamber 正在执行（busy）…"
+                )
+            time.sleep(sleep_for)
             continue
 
         if status_type != "idle":
@@ -764,11 +901,7 @@ def wait_for_completion(
 
         if has_pending_user_action(round_messages):
             saw_pending_user_action = True
-            update(
-                "请在 OpenChamber 中处理：会话 "
-                f"{dispatch.session_id} 有未回答的问题或权限请求；"
-                "处理完成后中继将自动继续并回传"
-            )
+            update(pending_user_action_prompt(dispatch.session_id))
             time.sleep(min(poll_interval, max(0.1, deadline - time.monotonic())))
             continue
         saw_pending_user_action = False
@@ -780,9 +913,15 @@ def wait_for_completion(
                 f"OpenChamber task failed in session {dispatch.session_id}: "
                 f"{detail!r}"
             )
+        completed_ts = (
+            (info.get("time") or {}).get("completed")
+            if isinstance(info, Mapping)
+            else None
+        )
         completed = (
-            isinstance(info, Mapping)
-            and isinstance((info.get("time") or {}).get("completed"), int)
+            isinstance(completed_ts, int)
+            and not isinstance(completed_ts, bool)
+            and completed_ts > 0
         )
         if not completed:
             if incomplete_grace_deadline is None:

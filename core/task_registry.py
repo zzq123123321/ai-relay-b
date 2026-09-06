@@ -13,7 +13,18 @@ class TaskRegistryError(RuntimeError):
 
 
 class TaskRegistry:
-    EXTRA_FIELDS = frozenset({"executor", "session_id", "directory", "reply_file"})
+    EXTRA_FIELDS = frozenset(
+        {
+            "executor",
+            "session_id",
+            "directory",
+            "reply_file",
+            "requested_model",
+            "resolved_model",
+            "actual_model",
+            "model_note",
+        }
+    )
 
     def __init__(self, path: Path | None = None):
         self.path = path or (data_dir() / "tasks.json")
@@ -24,6 +35,15 @@ class TaskRegistry:
 
     def record(self, task_id: str) -> dict[str, str] | None:
         return self._states.get(task_id)
+
+    def completed_records(self) -> list[dict[str, str]]:
+        """Saved COMPLETED tasks in completion order (newest last), each
+        record carrying its ``task_id``, for repeat copy after a restart."""
+        return [
+            {**record, "task_id": task_id}
+            for task_id, record in self._states.items()
+            if record.get("state") == "COMPLETED"
+        ]
 
     def mark(
         self,

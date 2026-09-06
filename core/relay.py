@@ -43,7 +43,13 @@ def resolve_executor_kind(target: str, settings: RelaySettings) -> str:
 
 @dataclass(frozen=True, slots=True)
 class TaskOutcome:
-    """What the UI needs after a finished task (success path only)."""
+    """Task/session identity after a task started or finished.
+
+    ``current_session`` is set as soon as the OpenChamber session exists and
+    is persisted, and is kept after failure so the UI can open the session
+    of the task that is currently running or just failed.  ``outcome`` is
+    the LAST SUCCESS reply reference, kept separately for repeat copy.
+    """
 
     task_id: str
     executor: str
@@ -67,6 +73,7 @@ class RelayWorkflow:
         self.openchamber = openchamber
         self.replies_dir = replies_dir or (data_dir() / "replies")
         self.outcome: TaskOutcome | None = None
+        self.current_session: TaskOutcome | None = None
 
     # ------------------------------------------------------------------ #
     # entry point
@@ -76,8 +83,13 @@ class RelayWorkflow:
         self,
         text: str,
         status_callback: Callable[[str], None] | None = None,
+        session_callback: Callable[[TaskOutcome], None] | None = None,
     ) -> str:
         update = status_callback or (lambda _status: None)
+        # A new task invalidates the previous task's current session so the
+        # UI's open-session button never points at an older task while this
+        # one is being routed.
+        self.current_session = None
         try:
             message = parse_message(text)
 
@@ -98,7 +110,7 @@ class RelayWorkflow:
 
             executor_kind = resolve_executor_kind(message.target, self.settings)
             if executor_kind == TARGET_OPENCHAMBER:
-                return self._run_openchamber(message, update)
+                return self._run_openchamber(message, update, session_callback)
             return self._run_reasonix(message, update)
         except RelayProtocolError as exc:
             raise RelayWorkflowError(f"invalid clipboard task: {exc}") from exc
@@ -143,7 +155,12 @@ class RelayWorkflow:
             return self.openchamber
         return OpenChamberClient(self.settings.openchamber_url)
 
-    def _run_openchamber(self, message: RelayMessage, update) -> str:
+    def _run_openchamber(
+        self,
+        message: RelayMessage,
+        update,
+        session_callback: Callable[[TaskOutcome], None] | None = None,
+    ) -> str:
         directory = self.settings.openchamber_directory.strip()
         if not directory:
             self.registry.mark(
@@ -168,6 +185,17 @@ class RelayWorkflow:
                 session_id=session_id,
                 directory=directory,
             )
+            # Notify the UI as soon as the session exists AND is persisted:
+            # from this moment the open-session button must point at THIS
+            # task, during execution as well as after failure.
+            self.current_session = TaskOutcome(
+                task_id=message.message_id,
+                executor=TARGET_OPENCHAMBER,
+                session_id=session_id,
+                directory=directory,
+            )
+            if session_callback is not None:
+                session_callback(self.current_session)
 
             update("正在请求 OpenChamber 打开会话")
             client.open_session(session_id)  # failure: do NOT send the task
@@ -180,6 +208,25 @@ class RelayWorkflow:
                 directory,
                 agent=self.settings.openchamber_agent.strip() or None,
                 model=model,
+            )
+            # Persist requested/resolved model NOW: it must survive any
+            # later state update (a mismatch warning must not vanish).
+            self.registry.mark(
+                message.message_id,
+                "PROCESSING",
+                executor=TARGET_OPENCHAMBER,
+                session_id=session_id,
+                directory=directory,
+                requested_model=(
+                    dispatch.requested_model.label()
+                    if dispatch.requested_model is not None
+                    else None
+                ),
+                resolved_model=(
+                    dispatch.resolved_model.label()
+                    if dispatch.resolved_model is not None
+                    else None
+                ),
             )
             if dispatch.resolved_model is not None and model is not None \
                     and dispatch.resolved_model != model:
@@ -215,14 +262,6 @@ class RelayWorkflow:
                 message.max_rounds,
             )
             reply_file = self.save_reply(message.message_id, response)
-            self.registry.mark(
-                message.message_id,
-                "COMPLETED",
-                executor=TARGET_OPENCHAMBER,
-                session_id=session_id,
-                directory=directory,
-                reply_file=str(reply_file),
-            )
             note = None
             if result.model_mismatch:
                 actual = result.actual_model.label() if result.actual_model else "未知"
@@ -232,6 +271,30 @@ class RelayWorkflow:
                     else "未指定"
                 )
                 note = f"模型不一致：实际 {actual}，请求/解析 {expected}"
+            self.registry.mark(
+                message.message_id,
+                "COMPLETED",
+                executor=TARGET_OPENCHAMBER,
+                session_id=session_id,
+                directory=directory,
+                reply_file=str(reply_file),
+                requested_model=(
+                    result.requested_model.label()
+                    if result.requested_model is not None
+                    else None
+                ),
+                resolved_model=(
+                    result.resolved_model.label()
+                    if result.resolved_model is not None
+                    else None
+                ),
+                actual_model=(
+                    result.actual_model.label()
+                    if result.actual_model is not None
+                    else None
+                ),
+                model_note=note,
+            )
             self.outcome = TaskOutcome(
                 task_id=message.message_id,
                 executor=TARGET_OPENCHAMBER,
@@ -239,6 +302,7 @@ class RelayWorkflow:
                 directory=directory,
                 note=note,
             )
+            self.current_session = self.outcome
             return response
         except Exception as exc:
             error = f"openchamber_execute:{type(exc).__name__}: {exc}"

@@ -14,7 +14,6 @@ from tests.fakes import (
     ScriptedOpenChamber,
     assistant_message,
     make_dispatch,
-    permission_part,
     question_part,
     text_part,
     tool_part,
@@ -98,7 +97,7 @@ def test_truncated_finish_is_failure():
             user_message("u2", "new task", 1000),
             assistant_message(
                 "a2", 1100, completed=1200, finish="length",
-                parts=[text_part("partial answer")],
+                parts=[text_part("partial answer")], parent_id="u2",
             ),
         ]
     ]
@@ -118,7 +117,7 @@ def test_run_error_is_failure_with_detail():
                 1100,
                 completed=1200,
                 error={"name": "ProviderError", "message": "provider down"},
-                parts=[text_part("")],
+                parts=[text_part("")], parent_id="u2",
             ),
         ]
     ]
@@ -152,7 +151,7 @@ def test_model_mismatch_detected_between_actual_and_resolved():
             user_message("u2", "new task", 1000),
             assistant_message(
                 "a2", 1100, completed=1200, finish="stop",
-                parts=[text_part("done")], model=resolved,
+                parts=[text_part("done")], model=resolved, parent_id="u2",
             ),
         ]
     ]
@@ -165,7 +164,7 @@ def test_model_mismatch_detected_between_actual_and_resolved():
             user_message("u2", "new task", 1000),
             assistant_message(
                 "a2", 1100, completed=1200, finish="stop",
-                parts=[text_part("done")], model=other,
+                parts=[text_part("done")], model=other, parent_id="u2",
             ),
         ]
     ]
@@ -176,7 +175,9 @@ def test_model_mismatch_detected_between_actual_and_resolved():
     assert result2.actual_model == other
 
 
-def test_final_text_falls_back_to_earlier_assistant_message():
+def test_only_final_message_text_is_used():
+    """Intermediate ('tool-calls') text must never leak into the final
+    answer: only the LAST message of the verified order contributes text."""
     fake = ScriptedOpenChamber()
     fake.status_timeline = ["idle"]
     fake.message_timelines = [
@@ -185,21 +186,71 @@ def test_final_text_falls_back_to_earlier_assistant_message():
             user_message("u2", "new task", 1000),
             assistant_message(
                 "a2", 1100, completed=1150, finish="tool-calls",
-                parts=[tool_part("bash", "completed", "x"), text_part("part1")],
+                parts=[tool_part("bash", "completed", "x"), text_part("intermediate")],
+                parent_id="u2",
             ),
             assistant_message(
                 "a3", 1200, completed=1300, finish="stop",
-                parts=[tool_part("write", "completed", "y")],
+                parts=[text_part("FINAL TEXT")], parent_id="u2",
             ),
         ]
     ]
     result = run(fake, new_round_dispatch())
-    assert result.final_text == "part1"
-    assert result.tool_calls == ("bash", "write")
+    assert result.final_text == "FINAL TEXT"
+    assert result.tool_calls == ("bash",)
+
+
+def test_empty_final_text_is_reported_not_falls_back():
+    """A final assistant message without text must fail (no fallback to an
+    earlier message's text)."""
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1150, finish="tool-calls",
+                parts=[text_part("earlier intermediate text")], parent_id="u2",
+            ),
+            assistant_message(
+                "a3", 1200, completed=1300, finish="stop",
+                parts=[tool_part("write", "completed", "y")], parent_id="u2",
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberSessionError, match="no final text"):
+        run(fake, new_round_dispatch())
+
+
+def test_synthetic_text_part_is_excluded():
+    """Real stack marks injected/internal alternate messages with
+    ``synthetic: true``; such text must not be used as the final answer."""
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1300, finish="stop",
+                parent_id="u2",
+                parts=[
+                    {
+                        "type": "text",
+                        "text": "Foreground fallback replay.",
+                        "synthetic": True,
+                    }
+                ],
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberSessionError, match="no final text"):
+        run(fake, new_round_dispatch())
 
 
 # ---------------------------------------------------------------------- #
-# round association: message ids, not time windows
+# round association: message ids and verified parent chains
 # ---------------------------------------------------------------------- #
 
 
@@ -265,25 +316,58 @@ def test_same_message_timestamps_still_attributed_by_id():
     assert result.final_text == "final"
 
 
-def test_reordered_message_list_still_attributed_by_id():
-    """The assistant message is returned BEFORE its user message."""
+def test_round_order_uses_created_time_not_array_position():
+    """The final message is chosen by the verified ``time.created`` order,
+    never by the position in the returned array (the final message is
+    returned BEFORE the earlier tool-call turn here)."""
+    final_turn = assistant_message(
+        "a3", 1200, completed=1300, finish="stop",
+        parts=[text_part("FINAL TEXT")], parent_id="u2",
+    )
+    tool_turn = assistant_message(
+        "a2", 1100, completed=1150, finish="tool-calls",
+        parts=[tool_part("bash", "completed", "x"), text_part("intermediate")],
+        parent_id="u2",
+    )
     fake = ScriptedOpenChamber()
     fake.status_timeline = ["idle"]
     fake.message_timelines = [
         HISTORY
         + [
+            user_message("u2", "relay task", 1000),
+            final_turn,  # array position wrong on purpose
+            tool_turn,
+        ]
+    ]
+    result = run(fake, new_round_dispatch())
+    assert result.final_text == "FINAL TEXT"
+    assert result.tool_calls == ("bash",)
+
+
+def test_duplicate_created_timestamps_fail_clearly():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "relay task", 1000),
             assistant_message(
                 "a2", 1100, completed=1200, finish="stop",
                 parts=[text_part("final")], parent_id="u2",
             ),
-            user_message("u2", "relay task", 1000),
+            assistant_message(
+                "a3", 1100, completed=1300, finish="stop",
+                parts=[text_part("other")], parent_id="u2",
+            ),
         ]
     ]
-    result = run(fake, new_round_dispatch())
-    assert result.final_text == "final"
+    with pytest.raises(OpenChamberSessionError, match="strictly order"):
+        run(fake, new_round_dispatch())
 
 
-def test_assistant_attached_to_other_user_message_is_ambiguous():
+def test_unverifiable_parent_chain_is_ambiguous():
+    """An assistant message whose parentID is missing/unknown cannot be
+    proven to belong to this round -> fail, never use it."""
     fake = ScriptedOpenChamber()
     fake.status_timeline = ["idle"]
     fake.message_timelines = [
@@ -292,11 +376,31 @@ def test_assistant_attached_to_other_user_message_is_ambiguous():
             user_message("u2", "relay task", 1000),
             assistant_message(
                 "a2", 1100, completed=1200, finish="stop",
-                parts=[text_part("final")], parent_id="u1",  # points at history!
+                parts=[text_part("mystery answer")],  # no parentID
             ),
         ]
     ]
     with pytest.raises(OpenChamberSessionError, match="ambiguous"):
+        run(fake, new_round_dispatch())
+
+
+def test_assistant_attached_to_other_user_is_not_this_round():
+    """An assistant message that verifiably chains to ANOTHER user is not
+    part of this round; with no reply of its own the round fails (the
+    history reply is never used)."""
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "relay task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1200, finish="stop",
+                parts=[text_part("final")], parent_id="u1",  # chains to history
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberSessionError, match="no assistant reply"):
         run(fake, new_round_dispatch())
 
 
@@ -327,6 +431,21 @@ def test_user_message_id_from_send_response_wins():
     dispatch = new_round_dispatch(user_message_id="u2", pre_ids=frozenset())
     result = run(fake, dispatch)
     assert result.final_text == "final"
+
+
+def test_snapshot_failure_never_uses_history_reply():
+    """A dispatch whose pre-send snapshot failed cannot prove WHICH user
+    message is new: the round is ambiguous even if only one user exists
+    (issue: the old code anchored on the history user and returned the old
+    reply as success)."""
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [list(HISTORY)]
+    dispatch = make_dispatch(
+        directory="D:/proj", pre_ids=HISTORY_IDS, snapshot_ok=False
+    )
+    with pytest.raises(OpenChamberSessionError, match="ambiguous"):
+        run(fake, dispatch)
 
 
 # ---------------------------------------------------------------------- #
@@ -392,6 +511,46 @@ def test_status_interface_failure_is_never_success():
 
 
 # ---------------------------------------------------------------------- #
+# completed timestamp sanity: only positive integers count
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("completed", [0, -1, True, False])
+def test_completed_must_be_positive_timestamp(completed):
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "relay task", 1000),
+            assistant_message(
+                "a2", 1100, completed=completed, finish="stop",
+                parts=[text_part("final")], parent_id="u2",
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberSessionError, match="not completed"):
+        run(fake, new_round_dispatch())
+
+
+def test_completed_positive_timestamp_completes():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "relay task", 1000),
+            assistant_message(
+                "a2", 1100, completed=12345, finish="stop",
+                parts=[text_part("final")], parent_id="u2",
+            ),
+        ]
+    ]
+    result = run(fake, new_round_dispatch())
+    assert result.final_text == "final"
+
+
+# ---------------------------------------------------------------------- #
 # questions and permission prompts: wait, never auto-answer
 # ---------------------------------------------------------------------- #
 
@@ -412,6 +571,7 @@ def test_pending_question_keeps_waiting_then_completes_after_answer():
             assistant_message(
                 "a2", 1100,
                 parts=[question_part("pending")],  # waiting for the user
+                parent_id="u2",
             ),
         ]
     )
@@ -425,6 +585,7 @@ def test_pending_question_keeps_waiting_then_completes_after_answer():
                 completed=1200,
                 finish="tool-calls",
                 parts=[question_part("completed")],
+                parent_id="u2",
             ),
             assistant_message(
                 "a3",
@@ -436,12 +597,57 @@ def test_pending_question_keeps_waiting_then_completes_after_answer():
             ),
         ]
     )
-    # messages() is only called on the idle polls:
-    # idle#1 -> pending, idle#2 -> pending, busy (no call), idle#3 -> done
+    # the rounds are consumed across busy and idle polls alike: busy polls
+    # read via round_has_pending_user_action, idle polls via messages()
     fake.message_timelines = [pending_round, pending_round, answered_round]
     result = run(fake, new_round_dispatch())
     assert result.final_text == "final after answer"
     assert result.tool_calls == ("question",)
+
+
+def test_busy_with_pending_question_reports_wait_then_completes():
+    """During busy the relay must DETECT a pending question (it reads the
+    session messages while busy, not only when idle) and report
+    '请在 OpenChamber 中处理' instead of only reporting busy."""
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["busy", "busy", "idle", "idle", "busy", "idle"]
+    pending_round = (
+        HISTORY
+        + [
+            user_message("u2", "relay task", 1000),
+            assistant_message(
+                "a2", 1100, parts=[question_part("pending")], parent_id="u2",
+            ),
+        ]
+    )
+    answered_round = (
+        HISTORY
+        + [
+            user_message("u2", "relay task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1200, finish="tool-calls",
+                parts=[question_part("completed")], parent_id="u2",
+            ),
+            assistant_message(
+                "a3", 1201, completed=1300, finish="stop",
+                parts=[text_part("final after answer")], parent_id="u2",
+            ),
+        ]
+    )
+    fake.message_timelines = [pending_round, pending_round, answered_round]
+    statuses_seen: list[str] = []
+    result = wait_for_completion(
+        fake,
+        new_round_dispatch(),
+        5.0,
+        poll_interval=0.01,
+        grace_seconds=0.05,
+        status_callback=statuses_seen.append,
+    )
+    assert result.final_text == "final after answer"
+    assert any("请在 OpenChamber 中处理" in s for s in statuses_seen)
+    # the busy polls actually read the session messages (reads != 0)
+    assert fake.messages_read >= 1
 
 
 def test_unanswered_question_times_out_instead_of_failing_or_guessing():
@@ -451,7 +657,7 @@ def test_unanswered_question_times_out_instead_of_failing_or_guessing():
         [
             user_message("u2", "relay task", 1000),
             assistant_message(
-                "a2", 1100, parts=[question_part("pending")]
+                "a2", 1100, parts=[question_part("pending")], parent_id="u2",
             ),
         ]
     ]
@@ -459,21 +665,24 @@ def test_unanswered_question_times_out_instead_of_failing_or_guessing():
         run(fake, new_round_dispatch(pre_ids=frozenset()), timeout=0.3)
 
 
-def test_pending_permission_prompt_keeps_waiting():
+def test_pending_permission_tool_part_keeps_waiting():
+    """Real OpenCode shape for a permission prompt is a pending TOOL part
+    (state.status == 'pending'), not a separate 'permission' part."""
     fake = ScriptedOpenChamber()
     fake.status_timeline = ["busy", "idle", "idle", "busy", "idle"]
     pending_round = [
         user_message("u2", "relay task", 1000),
         assistant_message(
             "a2", 1100,
-            parts=[tool_part("bash", "pending"), permission_part("pending")],
+            parts=[tool_part("bash", "pending")],
+            parent_id="u2",
         ),
     ]
     answered_round = [
         user_message("u2", "relay task", 1000),
         assistant_message(
             "a2", 1100, completed=1200, finish="tool-calls",
-            parts=[tool_part("bash", "completed", "ok")],
+            parts=[tool_part("bash", "completed", "ok")], parent_id="u2",
         ),
         assistant_message(
             "a3", 1201, completed=1300, finish="stop",

@@ -173,10 +173,10 @@ def test_send_posts_prompt_parses_real_shape_and_snapshots_first():
     assert body["model"] == {"providerID": "4090", "modelID": "qwen3.8-27b"}
 
 
-def test_send_snapshot_failure_degrades_safely():
-    """If the pre-send snapshot cannot be read, the send still proceeds
-    and the round is later located among ALL user messages (no guessing,
-    possible over-reporting of ambiguity only)."""
+def test_send_snapshot_failure_aborts_before_sending():
+    """A failed pre-send snapshot must STOP the send: with no trustworthy
+    snapshot the round cannot be attributed, so guessing is forbidden and
+    the task is never dispatched."""
     http = FakeHttp()
     http.route(
         "GET", MESSAGE_PATH, FakeResponse(500, {"error": "snapshot failed"})
@@ -194,14 +194,15 @@ def test_send_snapshot_failure_degrades_safely():
         ),
     )
     client = make_client(http)
-    dispatch = client.send("ses_1", "do it", "D:/p")
-    assert dispatch.pre_send_snapshot_ok is False
-    assert dispatch.pre_send_message_ids == frozenset()
-    assert dispatch.prompt_dispatched is True
+    with pytest.raises(OpenChamberSessionError, match="was NOT sent"):
+        client.send("ses_1", "do it", "D:/p")
+    assert [call for call in http.calls if call[0] == "POST"] == []
 
 
 def test_send_user_message_id_parsed_when_present():
     http = FakeHttp()
+    # pre-send snapshot must be readable for the send to proceed
+    http.route("GET", MESSAGE_PATH, FakeResponse(200, []))
     http.route(
         "POST",
         "/api/openchamber/sessions/ses_1/send",
@@ -221,6 +222,8 @@ def test_send_user_message_id_parsed_when_present():
 
 def test_send_without_dispatched_prompt_fails():
     http = FakeHttp()
+    # pre-send snapshot must be readable for the send to proceed
+    http.route("GET", MESSAGE_PATH, FakeResponse(200, []))
     http.route(
         "POST",
         "/api/openchamber/sessions/ses_1/send",
@@ -277,6 +280,22 @@ def test_session_status_unknown_type_stays_unknown():
     )
     client = make_client(http)
     assert client.session_status("ses_1", "D:/p") == "unknown"
+
+
+def test_session_status_null_entry_is_unknown():
+    """A session id PRESENT in the map with a null value is malformed data
+    (issue: the old code reported `idle`); only a MISSING id means idle
+    per OpenCode's SessionStatus delete-on-idle semantics."""
+    http = FakeHttp()
+    http.route(
+        "GET",
+        STATUS_PATH,
+        FakeResponse(200, {"ses_1": None}),
+    )
+    client = make_client(http)
+    assert client.session_status("ses_1", "D:/p") == "unknown"
+    # a session that the status map no longer lists is still idle
+    assert client.session_status("ses_2", "D:/p") == "idle"
 
 
 def test_session_status_malformed_payload_is_unknown():
