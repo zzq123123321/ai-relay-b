@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -255,22 +256,57 @@ class RelayWorkflow:
             raise
 
     # ------------------------------------------------------------------ #
-    # reply persistence
+    # reply persistence (untrusted task ids never touch the file name)
     # ------------------------------------------------------------------ #
+
+    def reply_file_for(self, task_id: str) -> Path:
+        """Hash-derived reply file path: safe for any task id (traversal,
+        absolute paths, drive letters, reserved names, illegal characters,
+        CJK ids all collapse to the same hex name pattern)."""
+        digest = hashlib.sha256(task_id.encode("utf-8", "surrogatepass")).hexdigest()
+        return self.replies_dir / f"rel_{digest}.response.txt"
 
     def save_reply(self, task_id: str, response: str) -> Path:
         if not response.strip():
             raise RelayWorkflowError("reply must not be empty")
         self.replies_dir.mkdir(parents=True, exist_ok=True)
-        path = self.replies_dir / f"{task_id}.response.txt"
+        path = self.reply_file_for(task_id)
         path.write_text(response, encoding="utf-8")
         return path
 
-    def load_reply(self, task_id: str) -> str | None:
-        path = self.replies_dir / f"{task_id}.response.txt"
-        if not path.exists():
-            return None
+    def _contained_reply_path(self, path: Path) -> Path | None:
+        """Return ``path`` only if it resolves inside the replies dir."""
         try:
-            return path.read_text(encoding="utf-8")
+            resolved = path.resolve()
+            root = self.replies_dir.resolve()
         except OSError:
             return None
+        if not resolved.is_relative_to(root):
+            return None
+        return resolved
+
+    def load_reply(self, task_id: str) -> str | None:
+        # 1) the registry mapping recorded when the reply was saved
+        record = self.registry.record(task_id)
+        if record and record.get("reply_file"):
+            path = self._contained_reply_path(Path(record["reply_file"]))
+            if path is not None and path.is_file():
+                try:
+                    return path.read_text(encoding="utf-8")
+                except OSError:
+                    return None
+        # 2) the current hash-derived name
+        path = self._contained_reply_path(self.reply_file_for(task_id))
+        if path is not None and path.is_file():
+            try:
+                return path.read_text(encoding="utf-8")
+            except OSError:
+                return None
+        # 3) legacy name written before the hash-naming change
+        legacy = self._contained_reply_path(self.replies_dir / f"{task_id}.response.txt")
+        if legacy is not None and legacy.is_file():
+            try:
+                return legacy.read_text(encoding="utf-8")
+            except OSError:
+                return None
+        return None

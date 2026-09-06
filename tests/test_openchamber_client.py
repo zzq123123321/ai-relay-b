@@ -22,6 +22,9 @@ from tests.fakes import (
     user_message,
 )
 
+MESSAGE_PATH = "/api/session/ses_1/message?directory=D%3A%2Fp"
+STATUS_PATH = "/api/session/status?directory=D%3A%2Fp"
+
 
 def test_verify_ok():
     http = FakeHttp()
@@ -105,7 +108,9 @@ def test_open_session_failure_raises(monkeypatch):
         client.open_session("ses_abc")
 
 
-def test_send_posts_prompt_and_parses_dispatch():
+def test_send_posts_prompt_parses_real_shape_and_snapshots_first():
+    """The local 1.22.2 send response carries no baseline message id; the
+    client must snapshot the session's message ids BEFORE the POST."""
     http = FakeHttp()
     http.route(
         "POST",
@@ -116,7 +121,6 @@ def test_send_posts_prompt_and_parses_dispatch():
                 "action": "send",
                 "sessionId": "ses_1",
                 "directory": "D:/p",
-                "baselineAssistantMessageId": "msg_base",
                 "model": {"providerID": "9router-new", "modelID": "9auto"},
                 "agent": "orchestrator",
                 "promptDispatched": True,
@@ -126,16 +130,13 @@ def test_send_posts_prompt_and_parses_dispatch():
     )
     http.route(
         "GET",
-        "/api/session/ses_1/message?directory=D%3A%2Fp",
+        MESSAGE_PATH,
         FakeResponse(
             200,
             [
                 user_message("u1", "old task", 500),
                 assistant_message(
-                    "msg_base",
-                    600,
-                    completed=700,
-                    finish="stop",
+                    "a1", 600, completed=700, finish="stop",
                     parts=[text_part("old reply")],
                 ),
             ],
@@ -149,20 +150,73 @@ def test_send_posts_prompt_and_parses_dispatch():
         agent="build",
         model=ModelRef("4090", "qwen3.8-27b"),
     )
-    assert dispatch.baseline_message_id == "msg_base"
-    assert dispatch.baseline_message_time == 600
+    # no baseline field in the response -> attribution relies on the
+    # pre-send snapshot
+    assert dispatch.user_message_id is None
+    assert dispatch.pre_send_message_ids == frozenset({"u1", "a1"})
+    assert dispatch.pre_send_snapshot_ok is True
     assert dispatch.resolved_model == ModelRef("9router-new", "9auto")
     assert dispatch.requested_model == ModelRef("4090", "qwen3.8-27b")
     assert dispatch.agent == "orchestrator"
     assert dispatch.prompt_dispatched is True
 
-    method, path, body = http.calls[0]
+    # the snapshot (GET) strictly precedes the send (POST)
+    paths = [call[1] for call in http.calls]
+    assert paths.index(MESSAGE_PATH) < paths.index(
+        "/api/openchamber/sessions/ses_1/send"
+    )
+    method, path, body = http.calls[-1]
     assert method == "POST"
-    assert path == "/api/openchamber/sessions/ses_1/send"
     assert body["prompt"] == "do it"
     assert body["directory"] == "D:/p"
     assert body["agent"] == "build"
     assert body["model"] == {"providerID": "4090", "modelID": "qwen3.8-27b"}
+
+
+def test_send_snapshot_failure_degrades_safely():
+    """If the pre-send snapshot cannot be read, the send still proceeds
+    and the round is later located among ALL user messages (no guessing,
+    possible over-reporting of ambiguity only)."""
+    http = FakeHttp()
+    http.route(
+        "GET", MESSAGE_PATH, FakeResponse(500, {"error": "snapshot failed"})
+    )
+    http.route(
+        "POST",
+        "/api/openchamber/sessions/ses_1/send",
+        FakeResponse(
+            200,
+            {
+                "model": {"providerID": "9router-new", "modelID": "9auto"},
+                "agent": "orchestrator",
+                "promptDispatched": True,
+            },
+        ),
+    )
+    client = make_client(http)
+    dispatch = client.send("ses_1", "do it", "D:/p")
+    assert dispatch.pre_send_snapshot_ok is False
+    assert dispatch.pre_send_message_ids == frozenset()
+    assert dispatch.prompt_dispatched is True
+
+
+def test_send_user_message_id_parsed_when_present():
+    http = FakeHttp()
+    http.route(
+        "POST",
+        "/api/openchamber/sessions/ses_1/send",
+        FakeResponse(
+            200,
+            {
+                "model": {"providerID": "9router-new", "modelID": "9auto"},
+                "promptDispatched": True,
+                "userMessageId": "msg_u_new",
+            },
+        ),
+    )
+    client = make_client(http)
+    dispatch = client.send("ses_1", "do it", "D:/p")
+    assert dispatch.user_message_id == "msg_u_new"
 
 
 def test_send_without_dispatched_prompt_fails():
@@ -170,9 +224,7 @@ def test_send_without_dispatched_prompt_fails():
     http.route(
         "POST",
         "/api/openchamber/sessions/ses_1/send",
-        FakeResponse(
-            200, {"promptDispatched": False, "promptError": "model offline"}
-        ),
+        FakeResponse(200, {"promptDispatched": False, "promptError": "model offline"}),
     )
     client = make_client(http)
     with pytest.raises(OpenChamberSessionError, match="did not dispatch"):
@@ -196,7 +248,7 @@ def test_session_status_lookup():
     http = FakeHttp()
     http.route(
         "GET",
-        "/api/session/status?directory=D%3A%2Fp",
+        STATUS_PATH,
         FakeResponse(
             200, {"ses_1": {"type": "busy"}, "ses_2": {"type": "idle"}}
         ),
@@ -204,14 +256,41 @@ def test_session_status_lookup():
     client = make_client(http)
     assert client.session_status("ses_1", "D:/p") == "busy"
     assert client.session_status("ses_2", "D:/p") == "idle"
-    assert client.session_status("ses_missing", "D:/p") == "unknown"
+    # a missing session id means idle: OpenCode's SessionStatus service
+    # deletes sessions from the map exactly when they become idle
+    assert client.session_status("ses_missing", "D:/p") == "idle"
+
+
+def test_session_status_empty_map_is_idle():
+    http = FakeHttp()
+    http.route("GET", STATUS_PATH, FakeResponse(200, {}))
+    client = make_client(http)
+    assert client.session_status("ses_1", "D:/p") == "idle"
+
+
+def test_session_status_unknown_type_stays_unknown():
+    http = FakeHttp()
+    http.route(
+        "GET",
+        STATUS_PATH,
+        FakeResponse(200, {"ses_1": {"type": "paused"}}),
+    )
+    client = make_client(http)
+    assert client.session_status("ses_1", "D:/p") == "unknown"
+
+
+def test_session_status_malformed_payload_is_unknown():
+    http = FakeHttp()
+    http.route("GET", STATUS_PATH, FakeResponse(200, ["not", "a", "map"]))
+    client = make_client(http)
+    assert client.session_status("ses_1", "D:/p") == "unknown"
 
 
 def test_messages_non_list_fails():
     http = FakeHttp()
     http.route(
         "GET",
-        "/api/session/ses_1/message?directory=D%3A%2Fp",
+        MESSAGE_PATH,
         FakeResponse(200, {"unexpected": True}),
     )
     client = make_client(http)

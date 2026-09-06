@@ -22,6 +22,7 @@ from tests.fakes import (
     ScriptedOpenChamber,
     assistant_message,
     make_dispatch,
+    question_part,
     text_part,
     user_message,
 )
@@ -234,7 +235,10 @@ def test_openchamber_task_persisted_and_reply_stored(tmp_path):
     assert record["executor"] == "OPENCHAMBER"
     assert record["session_id"] == "ses_test123"
     assert record["directory"] == "D:/proj"
-    assert (tmp_path / "replies" / "task-001.response.txt").exists()
+    # the reply file is hash-named (untrusted task ids never touch the name)
+    reply_files = list((tmp_path / "replies").glob("rel_*.response.txt"))
+    assert len(reply_files) == 1
+    assert record["reply_file"] == str(reply_files[0])
     assert wf.load_reply("task-001") == response
     assert wf.outcome is not None
     assert wf.outcome.session_id == "ses_test123"
@@ -251,7 +255,7 @@ def test_deeplink_failure_prevents_send(tmp_path):
     record = wf.registry.record("task-001")
     assert record["state"] == "FAILED"
     assert record["session_id"] == "ses_test123"  # kept for manual check
-    assert not (tmp_path / "replies" / "task-001.response.txt").exists()
+    assert wf.load_reply("task-001") is None
 
 
 def test_send_failure_keeps_session_and_fails(tmp_path):
@@ -289,11 +293,8 @@ def test_model_mismatch_reported_in_outcome(tmp_path):
     oc.send_dispatch = make_dispatch(
         session_id="ses_test123",
         directory="D:/proj",
-        baseline_id=None,
-        baseline_time=None,
         requested=requested,
         resolved=requested,
-        sent_at_ms=1000,
     )
     other = ModelRef("9router-new", "9auto")
     oc.message_timelines = [
@@ -344,3 +345,87 @@ def test_reasonix_failure_marks_failed(tmp_path):
     record = wf.registry.record("task-001")
     assert record["state"] == "FAILED"
     assert record["executor"] == "REASONIX"
+
+
+# ---------------------------------------------------------------------- #
+# OpenChamber questions / permissions / ambiguity at workflow level
+# ---------------------------------------------------------------------- #
+
+
+def test_question_waits_for_user_then_relay_continues(tmp_path):
+    oc = scripted_oc()
+    statuses = ["busy", "idle", "idle", "busy", "idle"]
+    pending = [
+        user_message("u_new", "task body", 1000),
+        assistant_message("a_new", 1100, parts=[question_part("pending")]),
+    ]
+    answered = [
+        user_message("u_new", "task body", 1000),
+        assistant_message(
+            "a_new", 1100, completed=1200, finish="tool-calls",
+            parts=[question_part("completed")],
+        ),
+        assistant_message(
+            "a_final", 1201, completed=1300, finish="stop",
+            parts=[text_part("final answer")],
+        ),
+    ]
+    oc.status_timeline = statuses
+    oc.message_timelines = [pending, pending, answered]
+    wf = make_workflow(tmp_path, oc=oc)
+    statuses_seen: list[str] = []
+    response = wf.process(
+        v1_task(TARGET_OPENCHAMBER, "do it"), statuses_seen.append
+    )
+    assert "final answer" in response
+    # the relay reported the wait for the user, never failed
+    assert any("请在 OpenChamber 中处理" in s for s in statuses_seen)
+    record = wf.registry.record("task-001")
+    assert record["state"] == "COMPLETED"
+    assert wf.load_reply("task-001") == response
+
+
+def test_ambiguous_round_fails_without_guessing(tmp_path):
+    oc = scripted_oc()
+    oc.status_timeline = ["idle"]
+    oc.message_timelines = [
+        [
+            user_message("u_new", "task body", 1000),
+            user_message("u_manual", "人工插入", 1001),
+            assistant_message(
+                "a_new", 1100, completed=1200, finish="stop",
+                parts=[text_part("final answer")],
+            ),
+        ]
+    ]
+    wf = make_workflow(tmp_path, oc=oc)
+    with pytest.raises(OpenChamberSessionError, match="ambiguous"):
+        wf.process(v1_task(TARGET_OPENCHAMBER, "do it"))
+    record = wf.registry.record("task-001")
+    assert record["state"] == "FAILED"
+    assert record["session_id"] == "ses_test123"
+    assert wf.load_reply("task-001") is None
+
+
+def test_unanswered_question_times_out_keeps_session(tmp_path):
+    oc = scripted_oc()
+    oc.status_timeline = ["idle"]
+    oc.message_timelines = [
+        [
+            user_message("u_new", "task body", 1000),
+            assistant_message("a_new", 1100, parts=[question_part("pending")]),
+        ]
+    ]
+    settings = RelaySettings(
+        default_target=TARGET_REASONIX,
+        openchamber_directory="D:/proj",
+        completion_timeout=0.3,
+        poll_interval=0.01,
+    )
+    wf = make_workflow(tmp_path, oc=oc, settings=settings)
+    with pytest.raises(OpenChamberTimeoutError, match="ses_test123"):
+        wf.process(v1_task(TARGET_OPENCHAMBER, "do it"))
+    record = wf.registry.record("task-001")
+    assert record["state"] == "FAILED"
+    assert record["session_id"] == "ses_test123"
+    assert sum(call.startswith("send:") for call in oc.call_log) == 1

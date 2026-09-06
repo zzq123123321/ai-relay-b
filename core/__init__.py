@@ -11,7 +11,6 @@ from core.openchamber import (
     OpenChamberSessionError,
     OpenChamberTimeoutError,
     OpenChamberUnavailableError,
-    OpenChamberUserActionRequired,
 )
 from core.protocol import (
     MessageType,
@@ -47,7 +46,6 @@ __all__ = [
     "OpenChamberSessionError",
     "OpenChamberTimeoutError",
     "OpenChamberUnavailableError",
-    "OpenChamberUserActionRequired",
     "ProtocolFormat",
     "RelayMessage",
     "RelayProtocolError",

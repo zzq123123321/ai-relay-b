@@ -73,27 +73,27 @@ def make_client(
 def make_dispatch(
     session_id: str = "ses_test123",
     directory: str = "D:/proj",
-    baseline_id: str | None = "msg_baseline",
-    baseline_time: int | None = 1000,
+    pre_ids: frozenset[str] | set[str] | None = None,
+    snapshot_ok: bool = True,
+    user_message_id: str | None = None,
     requested: ModelRef | None = None,
     resolved: ModelRef | None = None,
     agent: str | None = None,
     dispatched: bool = True,
     prompt_error: str | None = None,
-    sent_at_ms: int = 2000,
 ) -> OpenChamberDispatch:
     return OpenChamberDispatch(
         session_id=session_id,
         directory=directory,
-        baseline_message_id=baseline_id,
-        baseline_message_time=baseline_time,
         requested_model=requested,
         resolved_model=resolved,
         agent=agent,
         prompt_dispatched=dispatched,
         dispatched_as_command=False,
         prompt_error=prompt_error,
-        sent_at_ms=sent_at_ms,
+        user_message_id=user_message_id,
+        pre_send_message_ids=frozenset(pre_ids or ()),
+        pre_send_snapshot_ok=snapshot_ok,
     )
 
 
@@ -119,6 +119,7 @@ def assistant_message(
     model: ModelRef | None = None,
     agent: str | None = None,
     session_id: str = "ses_test123",
+    parent_id: str | None = None,
 ) -> dict:
     info: dict[str, Any] = {
         "id": msg_id,
@@ -126,6 +127,8 @@ def assistant_message(
         "role": "assistant",
         "time": {"created": created},
     }
+    if parent_id is not None:
+        info["parentID"] = parent_id
     if completed is not None:
         info["time"]["completed"] = completed
     if finish is not None:
@@ -152,8 +155,25 @@ def tool_part(name: str, status: str = "completed", output: str = "") -> dict:
     }
 
 
-def question_part() -> dict:
-    return {"type": "question", "questions": [{"question": "继续吗？"}]}
+def question_part(status: str = "pending") -> dict:
+    """Real OpenCode shape: a *tool* part named "question" with a state."""
+    state: dict[str, Any] = {"status": status}
+    if status == "pending":
+        state.update({"input": {}, "raw": ""})
+    else:
+        state.update(
+            {
+                "input": {
+                    "questions": [{"question": "继续吗？"}]
+                },
+                "output": "User has answered your questions.",
+            }
+        )
+    return {"type": "tool", "tool": "question", "state": state}
+
+
+def permission_part(status: str = "pending") -> dict:
+    return {"type": "permission", "permission": "bash", "state": {"status": status}}
 
 
 class ScriptedOpenChamber:
