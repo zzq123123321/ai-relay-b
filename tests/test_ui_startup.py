@@ -405,21 +405,23 @@ def test_model_details_three_layers_shown_in_ui(qapp, monkeypatch, tmp_path):
 
 def test_session_refresh_lists_candidates_and_saves_id(qapp, monkeypatch, tmp_path):
     """The session combo lists existing sessions from the OpenChamber API;
-    selecting one and saving settings stores its id (no auto-create, and a
-    free-typed id is kept verbatim)."""
+    selecting one and saving settings stores its id (no auto-create, a
+    free-typed id is kept verbatim, and a re-refresh restores by id — never
+    by the '标题（ses_xxx）' label)."""
     import ui as ui_mod
 
     from core.relay_settings import RelaySettings
 
     window = build_window(qapp, monkeypatch, tmp_path)
+    candidates = [
+        ("ses_A", "候选会话A"),
+        ("ses_B", "候选会话B"),
+        ("ses_gone", "已消失会话"),
+    ]
     monkeypatch.setattr(
         ui_mod.OpenChamberClient,
         "list_sessions",
-        lambda self, directory: [
-            ("ses_A", "候选会话A"),
-            ("ses_B", "候选会话B"),
-            ("ses_gone", "已消失会话"),
-        ],
+        lambda self, directory: list(candidates),
     )
     try:
         window._directory_edit.setText("D:/proj")
@@ -439,8 +441,27 @@ def test_session_refresh_lists_candidates_and_saves_id(qapp, monkeypatch, tmp_pa
         window._save_settings()
         assert window._settings.openchamber_session_id == "ses_B"
 
-        # a free-typed id not in the candidate list is kept verbatim
+        # regression: selecting a titled candidate, then refreshing again,
+        # then saving must still store the REAL id (never the display label)
+        candidates.append(("ses_C", "候选会话C"))
+        window._refresh_sessions()
+
+        def refreshed(count):
+            return (
+                window._session_combo.count() == count
+                and window._session_combo.currentData() == "ses_B"
+            )
+
+        assert wait_until(lambda: refreshed(5))
+        assert combo.currentText() == "候选会话B（ses_B）"
+        window._save_settings()
+        assert window._settings.openchamber_session_id == "ses_B"
+
+        # a free-typed id is preserved across a refresh, not treated as the
+        # selected candidate's label
         combo.setCurrentText("ses_free_typed")
+        window._refresh_sessions()
+        assert wait_until(lambda: combo.currentText() == "ses_free_typed")
         window._save_settings()
         assert window._settings.openchamber_session_id == "ses_free_typed"
 
@@ -448,6 +469,52 @@ def test_session_refresh_lists_candidates_and_saves_id(qapp, monkeypatch, tmp_pa
         combo.setCurrentIndex(0)
         window._save_settings()
         assert window._settings.openchamber_session_id == ""
+    finally:
+        window._listener.pause()
+        window.close()
+
+
+def test_refresh_completion_does_not_unlock_controls_during_task(
+    qapp, monkeypatch, tmp_path
+):
+    """While a refresh is pending a clipboard task may arrive; the refresh
+    success/failure callback must not re-enable execution controls until the
+    task is done (busy-aware restore)."""
+    window = build_window(qapp, monkeypatch, tmp_path)
+    try:
+        # a refresh was started: controls are disabled while the async list
+        # call is in flight, and a task starts executing meanwhile
+        window._set_controls_enabled(False)
+        window._busy = True
+
+        window._sessions_loaded([("ses_A", "候选会话A")])
+
+        def execution_controls_enabled():
+            return any(
+                b.isEnabled()
+                for b in (
+                    window.start_button,
+                    window.pause_button,
+                    window.check_button,
+                    window._save_settings_button,
+                    window._refresh_sessions_button,
+                )
+            )
+
+        assert not execution_controls_enabled()
+
+        # the failure callback must respect the running task as well
+        window._sessions_failed("boom")
+        assert not execution_controls_enabled()
+
+        # once the task has finished, both completion paths unlock again
+        window._busy = False
+        window._sessions_loaded([("ses_A", "候选会话A"), ("ses_B", "候选会话B")])
+        assert execution_controls_enabled()
+
+        window._busy = False
+        window._sessions_failed("boom2")
+        assert execution_controls_enabled()
     finally:
         window._listener.pause()
         window.close()

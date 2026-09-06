@@ -130,6 +130,7 @@ class RelayWindow(QMainWindow):
         self.setMinimumWidth(520)
 
         self._busy = False
+        self._pending_session_id = ""
         self._startup_check_pending = True
         self._pool = QThreadPool.globalInstance()
         self._reasonix = ReasonixAutomation()
@@ -464,6 +465,7 @@ class RelayWindow(QMainWindow):
         if not directory:
             self._show_error("请先填写项目目录，再刷新会话列表")
             return
+        self._pending_session_id = self._current_session_id()
         url = self._url_edit.text().strip() or DEFAULT_OPENCHAMBER_URL
         self._set_controls_enabled(False)
         task = SessionListTask(url, directory)
@@ -473,22 +475,21 @@ class RelayWindow(QMainWindow):
 
     @Slot(object)
     def _sessions_loaded(self, sessions: list):
-        configured = self._session_combo.currentText().strip()
-        if configured == "— 未配置会话 —":
-            configured = self._settings.openchamber_session_id
         self._session_combo.blockSignals(True)
         self._session_combo.clear()
         self._session_combo.addItem("— 未配置会话 —", None)
         for session_id, title in sessions:
             label = f"{title}（{session_id}）" if title else session_id
             self._session_combo.addItem(label, session_id)
-        index = self._session_combo.findData(configured)
+        index = self._session_combo.findData(self._pending_session_id)
         if index >= 0:
             self._session_combo.setCurrentIndex(index)
+        elif self._pending_session_id:
+            self._session_combo.setCurrentText(self._pending_session_id)
         else:
-            self._session_combo.setCurrentText(configured or "")
+            self._session_combo.setCurrentIndex(0)
         self._session_combo.blockSignals(False)
-        self._set_controls_enabled(True)
+        self._set_controls_enabled(not self._busy)
         self.detail_label.setText(
             f"找到 {len(sessions)} 个会话；请选择所需会话后保存设置。"
         )
@@ -496,7 +497,7 @@ class RelayWindow(QMainWindow):
 
     @Slot(str)
     def _sessions_failed(self, error: str):
-        self._set_controls_enabled(True)
+        self._set_controls_enabled(not self._busy)
         self._show_error(f"刷新会话列表失败：{error}")
 
     @Slot()
@@ -509,23 +510,7 @@ class RelayWindow(QMainWindow):
             self._settings.openchamber_directory = self._directory_edit.text().strip()
             self._settings.openchamber_agent = self._agent_edit.text().strip()
             self._settings.openchamber_model = self._model_edit.text().strip()
-            session_id = self._session_combo.currentData()
-            session_text = self._session_combo.currentText().strip()
-            index = self._session_combo.currentIndex()
-            # A real candidate selection is authoritative; if the operator
-            # edited the line and typed an id that differs from the selected
-            # item's label, the typed id is kept verbatim instead.
-            selected = (
-                isinstance(session_id, str)
-                and bool(session_id)
-                and session_text == self._session_combo.itemText(index)
-            )
-            if selected:
-                self._settings.openchamber_session_id = session_id
-            elif session_text == "— 未配置会话 —":
-                self._settings.openchamber_session_id = ""
-            else:
-                self._settings.openchamber_session_id = session_text
+            self._settings.openchamber_session_id = self._current_session_id()
             self._settings.validate()
             self._settings.save()
         except Exception as exc:
@@ -537,6 +522,25 @@ class RelayWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     # helpers
     # ------------------------------------------------------------------ #
+
+    def _current_session_id(self) -> str:
+        """The real session id currently held by the combo, extracted with the
+        same rule used when saving: a selected candidate's data is
+        authoritative; an edited/id-typed line that differs from the selected
+        item's label is kept verbatim.  The display label '标题（ses_xxx）' is
+        never treated as an id."""
+        session_id = self._session_combo.currentData()
+        session_text = self._session_combo.currentText().strip()
+        index = self._session_combo.currentIndex()
+        if (
+            isinstance(session_id, str)
+            and bool(session_id)
+            and session_text == self._session_combo.itemText(index)
+        ):
+            return session_id
+        if session_text == "— 未配置会话 —":
+            return ""
+        return session_text
 
     def _set_controls_enabled(self, enabled: bool):
         self.start_button.setEnabled(enabled and not self._listener.enabled)
