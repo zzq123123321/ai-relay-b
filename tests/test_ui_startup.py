@@ -365,6 +365,7 @@ def test_model_details_three_layers_shown_in_ui(qapp, monkeypatch, tmp_path):
     settings = RelaySettings(
         default_target=TARGET_OPENCHAMBER,
         openchamber_directory="D:/proj",
+        openchamber_session_id="ses_test123",
         openchamber_model="provA/modelA",
         completion_timeout=5.0,
         poll_interval=0.01,
@@ -397,6 +398,56 @@ def test_model_details_three_layers_shown_in_ui(qapp, monkeypatch, tmp_path):
         assert "模型不一致" in restored
         assert "provA/modelA" in restored
         assert "provB/modelB" in restored
+    finally:
+        window._listener.pause()
+        window.close()
+
+
+def test_session_refresh_lists_candidates_and_saves_id(qapp, monkeypatch, tmp_path):
+    """The session combo lists existing sessions from the OpenChamber API;
+    selecting one and saving settings stores its id (no auto-create, and a
+    free-typed id is kept verbatim)."""
+    import ui as ui_mod
+
+    from core.relay_settings import RelaySettings
+
+    window = build_window(qapp, monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        ui_mod.OpenChamberClient,
+        "list_sessions",
+        lambda self, directory: [
+            ("ses_A", "候选会话A"),
+            ("ses_B", "候选会话B"),
+            ("ses_gone", "已消失会话"),
+        ],
+    )
+    try:
+        window._directory_edit.setText("D:/proj")
+        window._refresh_sessions()
+
+        def populated():
+            return window._session_combo.count() == 4  # placeholder + 3
+
+        assert wait_until(populated)
+        combo = window._session_combo
+        assert combo.findData("ses_A") >= 0
+        assert combo.findData("ses_B") >= 0
+
+        # pick a candidate and save: the stored session id is the data value
+        combo.setCurrentIndex(combo.findData("ses_B"))
+        monkeypatch.setattr(RelaySettings, "save", lambda self, path=None: None)
+        window._save_settings()
+        assert window._settings.openchamber_session_id == "ses_B"
+
+        # a free-typed id not in the candidate list is kept verbatim
+        combo.setCurrentText("ses_free_typed")
+        window._save_settings()
+        assert window._settings.openchamber_session_id == "ses_free_typed"
+
+        # re-selecting the placeholder clears the id again
+        combo.setCurrentIndex(0)
+        window._save_settings()
+        assert window._settings.openchamber_session_id == ""
     finally:
         window._listener.pause()
         window.close()

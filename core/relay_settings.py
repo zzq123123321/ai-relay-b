@@ -24,6 +24,7 @@ class RelaySettings:
     default_target: str = TARGET_REASONIX
     openchamber_url: str = DEFAULT_OPENCHAMBER_URL
     openchamber_directory: str = ""
+    openchamber_session_id: str = ""
     openchamber_agent: str = ""
     openchamber_model: str = ""
     completion_timeout: float = 900.0

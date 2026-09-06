@@ -65,6 +65,7 @@ class WorkerSignals(QObject):
     succeeded = Signal(str)
     failed = Signal(str)
     session_started = Signal(object)
+    sessions = Signal(object)
 
 
 class RelayTask(QRunnable):
@@ -83,6 +84,23 @@ class RelayTask(QRunnable):
                 self.signals.session_started.emit,
             )
             self.signals.succeeded.emit(result)
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
+
+
+class SessionListTask(QRunnable):
+    def __init__(self, url: str, directory: str):
+        super().__init__()
+        self.url = url
+        self.directory = directory
+        self.signals = WorkerSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            client = OpenChamberClient(self.url)
+            sessions = client.list_sessions(self.directory)
+            self.signals.sessions.emit(sessions)
         except Exception as exc:
             self.signals.failed.emit(str(exc))
 
@@ -169,6 +187,7 @@ class RelayWindow(QMainWindow):
         self.recopy_button.clicked.connect(self._recopy_reply)
         self._saved_task_combo.currentIndexChanged.connect(self._saved_task_selected)
         self._save_settings_button.clicked.connect(self._save_settings)
+        self._refresh_sessions_button.clicked.connect(self._refresh_sessions)
 
         QTimer.singleShot(0, self._self_check)
 
@@ -200,11 +219,25 @@ class RelayWindow(QMainWindow):
         self._model_edit = QLineEdit(self._settings.openchamber_model)
         self._model_edit.setPlaceholderText("可选，格式 providerID/modelID")
 
+        self._session_combo = QComboBox()
+        self._session_combo.setEditable(True)
+        self._session_combo.setInsertPolicy(QComboBox.NoInsert)
+        self._session_combo.setMinimumWidth(220)
+        self._session_combo.addItem("— 未配置会话 —", None)
+        configured_session = self._settings.openchamber_session_id.strip()
+        if configured_session:
+            self._session_combo.setCurrentText(configured_session)
+        self._refresh_sessions_button = QPushButton("刷新会话列表")
+        session_row = QHBoxLayout()
+        session_row.addWidget(self._session_combo)
+        session_row.addWidget(self._refresh_sessions_button)
+
         form.addRow("默认执行端（TARGET: EXECUTOR）", self._executor_combo)
         form.addRow("OpenChamber 地址", self._url_edit)
         form.addRow("项目目录", self._directory_edit)
         form.addRow("Agent", self._agent_edit)
         form.addRow("Model", self._model_edit)
+        form.addRow("会话 ID（已有会话，不自动创建）", session_row)
 
         self._save_settings_button = QPushButton("保存设置")
         form.addRow(self._save_settings_button)
@@ -426,6 +459,47 @@ class RelayWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     @Slot()
+    def _refresh_sessions(self):
+        directory = self._directory_edit.text().strip()
+        if not directory:
+            self._show_error("请先填写项目目录，再刷新会话列表")
+            return
+        url = self._url_edit.text().strip() or DEFAULT_OPENCHAMBER_URL
+        self._set_controls_enabled(False)
+        task = SessionListTask(url, directory)
+        task.signals.sessions.connect(self._sessions_loaded)
+        task.signals.failed.connect(self._sessions_failed)
+        self._pool.start(task)
+
+    @Slot(object)
+    def _sessions_loaded(self, sessions: list):
+        configured = self._session_combo.currentText().strip()
+        if configured == "— 未配置会话 —":
+            configured = self._settings.openchamber_session_id
+        self._session_combo.blockSignals(True)
+        self._session_combo.clear()
+        self._session_combo.addItem("— 未配置会话 —", None)
+        for session_id, title in sessions:
+            label = f"{title}（{session_id}）" if title else session_id
+            self._session_combo.addItem(label, session_id)
+        index = self._session_combo.findData(configured)
+        if index >= 0:
+            self._session_combo.setCurrentIndex(index)
+        else:
+            self._session_combo.setCurrentText(configured or "")
+        self._session_combo.blockSignals(False)
+        self._set_controls_enabled(True)
+        self.detail_label.setText(
+            f"找到 {len(sessions)} 个会话；请选择所需会话后保存设置。"
+        )
+        self._set_status("会话列表已刷新")
+
+    @Slot(str)
+    def _sessions_failed(self, error: str):
+        self._set_controls_enabled(True)
+        self._show_error(f"刷新会话列表失败：{error}")
+
+    @Slot()
     def _save_settings(self):
         try:
             self._settings.default_target = (
@@ -435,6 +509,23 @@ class RelayWindow(QMainWindow):
             self._settings.openchamber_directory = self._directory_edit.text().strip()
             self._settings.openchamber_agent = self._agent_edit.text().strip()
             self._settings.openchamber_model = self._model_edit.text().strip()
+            session_id = self._session_combo.currentData()
+            session_text = self._session_combo.currentText().strip()
+            index = self._session_combo.currentIndex()
+            # A real candidate selection is authoritative; if the operator
+            # edited the line and typed an id that differs from the selected
+            # item's label, the typed id is kept verbatim instead.
+            selected = (
+                isinstance(session_id, str)
+                and bool(session_id)
+                and session_text == self._session_combo.itemText(index)
+            )
+            if selected:
+                self._settings.openchamber_session_id = session_id
+            elif session_text == "— 未配置会话 —":
+                self._settings.openchamber_session_id = ""
+            else:
+                self._settings.openchamber_session_id = session_text
             self._settings.validate()
             self._settings.save()
         except Exception as exc:
@@ -452,6 +543,7 @@ class RelayWindow(QMainWindow):
         self.pause_button.setEnabled(enabled and self._listener.enabled)
         self.check_button.setEnabled(enabled)
         self._save_settings_button.setEnabled(enabled)
+        self._refresh_sessions_button.setEnabled(enabled)
         self.open_session_button.setEnabled(False)
         self.recopy_button.setEnabled(False)
         if enabled:

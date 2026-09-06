@@ -29,14 +29,23 @@ OpenCode 1.18.29 (live probes, 2026-09-06):
   therefore means idle; the map only ever contains busy/retry entries.  A
   session id PRESENT with a null value is malformed data -> ``unknown``,
   never idle.
-* ``GET /api/session/:id/message?directory=...`` -> message array; assistant
-  ``info`` carries ``parentID`` (the user message that triggered the turn),
-  ``finish`` / ``error`` / ``time.completed`` / ``time.created``.  Round
-  membership is verified by walking each assistant message's ``parentID``
-  chain up to the round's user message; the round is ordered by the
-  strictly-increasing ``time.created`` timestamps, never by array position.
-  Text parts flagged ``synthetic: true`` (or whose state is ``ignored``)
-  are real-stack markers for injected/internal text and are not answers.
+* ``GET /api/session`` -> flat newest-first list of existing sessions (the
+  server caps the unfiltered list at the 100 most recent); each item carries
+  ``id``, ``title``, ``directory``/``path`` (the project directory), etc.
+  ``GET /api/session?directory=...`` filters server-side to ONE project
+  directory (both the backslash ``D:\\...`` and forward-slash ``D:/...``
+  forms are accepted and match).  ``GET /api/session/:id/message?directory=...``
+  -> message array; a MISSING session returns HTTP 404
+  ``{"name": "NotFoundError", ...}``.
+* ``GET /api/session/:id/message?directory=...`` (existing session) ->
+  message array; assistant ``info`` carries ``parentID`` (the user message
+  that triggered the turn), ``finish`` / ``error`` / ``time.completed`` /
+  ``time.created``.  Round membership is verified by walking each assistant
+  message's ``parentID`` chain up to the round's user message; the round is
+  ordered by the strictly-increasing ``time.created`` timestamps, never by
+  array position.  Text parts flagged ``synthetic: true`` (or whose state
+  is ``ignored``) are real-stack markers for injected/internal text and are
+  not answers.
 * A model question is a tool part ``{"type": "tool", "tool": "question",
   "state": {"status": "pending"}}``; it completes (status ``completed``)
   only after the user answers in the OpenChamber UI.  OTHER pending
@@ -267,6 +276,51 @@ class OpenChamberClient:
             raise OpenChamberSessionError(
                 f"failed to open session deep link {uri}: {exc}"
             ) from exc
+
+    def list_sessions(self, directory: str | None = None) -> list[tuple[str, str]]:
+        """Existing sessions as ``(session_id, title)`` pairs, newest first.
+
+        ``GET /api/session`` returns every session; appending
+        ``?directory=...`` filters server-side to one project directory
+        (both backslash and forward-slash directory forms are accepted by
+        OpenChamber 1.22.2).  The unfiltered list is capped by the server at
+        the 100 most recent sessions; the directory-filtered form is exact
+        for one directory.  This is a read-only listing used to present
+        existing-session candidates and to verify a configured session:
+        the relay NEVER creates or auto-switches sessions.
+        """
+        path = "/api/session"
+        if directory and directory.strip():
+            encoded = requests.utils.quote(directory, safe="")
+            path += f"?directory={encoded}"
+        payload = self._get_json(path)
+        if not isinstance(payload, list):
+            raise OpenChamberSessionError(
+                f"session list response is not a list: {type(payload).__name__}"
+            )
+        sessions: list[tuple[str, str]] = []
+        for item in payload:
+            if not isinstance(item, Mapping):
+                continue
+            session_id = item.get("id")
+            title = item.get("title")
+            if not isinstance(session_id, str) or not session_id:
+                continue
+            sessions.append((session_id, title if isinstance(title, str) else ""))
+        return sessions
+
+    def session_exists(self, session_id: str, directory: str) -> bool:
+        """Whether ``session_id`` exists under ``directory``.
+
+        Membership is checked against the server-filtered session list, so
+        a configured session that does NOT exist under the project directory
+        is reliably distinguished and reported (the relay must never fall
+        back to another session).  A failed listing raises instead of
+        guessing a False.
+        """
+        return any(
+            existing == session_id for existing, _title in self.list_sessions(directory)
+        )
 
     def _pre_send_snapshot(self, session_id: str, directory: str) -> tuple[frozenset[str], bool]:
         """Message ids already present in the session, taken before the send.

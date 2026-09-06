@@ -182,6 +182,9 @@ class ScriptedOpenChamber:
         self._status_index = 0
         self.message_timelines: list[list[dict]] = []
         self._message_index = 0
+        self.sessions: list[tuple[str, str, str]] = [
+            ("ses_test123", "Test session", "D:/proj")
+        ]
         self.next_session_id = "ses_test123"
         self.create_error: Exception | None = None
         self.open_error: Exception | None = None
@@ -208,6 +211,21 @@ class ScriptedOpenChamber:
         if self.open_error is not None:
             raise self.open_error
         self.call_log.append("opened")
+
+    def list_sessions(self, directory: str | None = None) -> list[tuple[str, str]]:
+        self.call_log.append(f"list:{directory or ''}")
+        return [
+            (session_id, title)
+            for session_id, title, session_dir in self.sessions
+            if directory is None or directory == session_dir
+        ]
+
+    def session_exists(self, session_id: str, directory: str) -> bool:
+        # mirrors the real client: membership in the server-filtered list
+        return any(
+            existing == session_id
+            for existing, _title in self.list_sessions(directory)
+        )
 
     def send(self, session_id, prompt, directory, agent=None, model=None) -> OpenChamberDispatch:
         self.call_log.append(f"send:{prompt!r}")

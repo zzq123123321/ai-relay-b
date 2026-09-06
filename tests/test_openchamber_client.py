@@ -315,3 +315,59 @@ def test_messages_non_list_fails():
     client = make_client(http)
     with pytest.raises(OpenChamberSessionError, match="not a list"):
         client.messages("ses_1", "D:/p")
+
+
+# ---------------------------------------------------------------------- #
+# existing-session listing (fixed-session candidates, never auto-create)
+# ---------------------------------------------------------------------- #
+
+
+def test_list_sessions_directory_filtered_parses_ids_and_titles():
+    http = FakeHttp()
+    http.route(
+        "GET",
+        "/api/session?directory=D%3A%2Fp",
+        FakeResponse(
+            200,
+            [
+                {"id": "ses_1", "directory": "D:/p", "title": "One"},
+                {"id": "ses_2", "directory": "D:/p", "title": ""},
+                {"id": ""},  # malformed -> skipped
+                {"title": "no id"},  # malformed -> skipped
+            ],
+        ),
+    )
+    client = make_client(http)
+    assert client.list_sessions("D:/p") == [("ses_1", "One"), ("ses_2", "")]
+
+
+def test_list_sessions_unfiltered():
+    http = FakeHttp()
+    http.route(
+        "GET",
+        "/api/session",
+        FakeResponse(200, [{"id": "ses_1", "title": "A"}]),
+    )
+    client = make_client(http)
+    assert client.list_sessions() == [("ses_1", "A")]
+    assert client.list_sessions("   ") == [("ses_1", "A")]  # blank -> unfiltered
+
+
+def test_list_sessions_non_list_fails():
+    http = FakeHttp()
+    http.route("GET", "/api/session", FakeResponse(200, {"x": 1}))
+    client = make_client(http)
+    with pytest.raises(OpenChamberSessionError, match="not a list"):
+        client.list_sessions()
+
+
+def test_session_exists_is_directory_membership():
+    http = FakeHttp()
+    http.route(
+        "GET",
+        "/api/session?directory=D%3A%2Fp",
+        FakeResponse(200, [{"id": "ses_1", "title": "One"}]),
+    )
+    client = make_client(http)
+    assert client.session_exists("ses_1", "D:/p") is True
+    assert client.session_exists("ses_other", "D:/p") is False

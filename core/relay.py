@@ -207,15 +207,32 @@ class RelayWorkflow:
             )
             raise RelayWorkflowError("OpenChamber 项目目录未配置，请在设置中填写")
 
+        session_id = self.settings.openchamber_session_id.strip()
+        if not session_id:
+            self.registry.mark(
+                message.message_id,
+                "FAILED",
+                "openchamber_config:missing session id",
+                executor=TARGET_OPENCHAMBER,
+                directory=directory,
+            )
+            raise RelayWorkflowError(
+                "OpenChamber 会话 ID 未配置：请在设置中选择或填写已有会话 ID；"
+                "中继不会自动创建或更换会话"
+            )
+
         client = self._openchamber_client()
-        session_id: str | None = None
         try:
             update("正在验证 OpenChamber 连接")
             client.verify()
 
-            update("正在创建 OpenChamber 会话")
-            title = f"AI Relay {message.message_id[:8]}"
-            session_id = client.create_session(title, directory)
+            update("正在确认 OpenChamber 会话")
+            if not client.session_exists(session_id, directory):
+                raise RelayWorkflowError(
+                    f"OpenChamber 会话 {session_id} 不存在或不属于项目目录"
+                    f"{directory}，任务未发送；中继不会自动创建或更换会话，"
+                    "请在设置中重新选择已有会话"
+                )
             self.registry.mark(
                 message.message_id,
                 "PROCESSING",

@@ -82,6 +82,7 @@ def make_workflow(tmp_path, reasonix=None, oc=None, settings=None, default=TARGE
     settings = settings or RelaySettings(
         default_target=default,
         openchamber_directory="D:/proj",
+        openchamber_session_id="ses_test123",
         completion_timeout=5.0,
         poll_interval=0.01,
     )
@@ -110,6 +111,86 @@ def scripted_oc(directory: str = "D:/proj") -> ScriptedOpenChamber:
         ]
     ]
     return oc
+
+
+class SharedContextOpenChamber:
+    """One fixed session whose message history GROWS between tasks, the way
+    a reused OpenChamber session does: round 2 sees round 1's messages.
+
+    ``send`` records the pre-send snapshot, appends the new user message AND
+    its completed assistant reply immediately (so the wait loop instantly
+    sees a finished round), and every round is attributed by the unchanged
+    client-side snapshot logic.
+    """
+
+    def __init__(self, session_id: str = "ses_test123", directory: str = "D:/proj"):
+        self.session_id = session_id
+        self.directory = directory
+        self.history: list[dict] = []
+        self.call_log: list[str] = []
+        self.status = "idle"
+
+    def verify(self) -> None:
+        self.call_log.append("verify")
+
+    def list_sessions(self, directory: str | None = None) -> list[tuple[str, str]]:
+        self.call_log.append(f"list:{directory or ''}")
+        if directory is not None and directory != self.directory:
+            return []
+        return [(self.session_id, "Shared test session")]
+
+    def session_exists(self, session_id: str, directory: str) -> bool:
+        return session_id == self.session_id and directory == self.directory
+
+    def open_session(self, session_id: str) -> None:
+        self.call_log.append(f"open:{session_id}")
+
+    def send(self, session_id, prompt, directory, agent=None, model=None) -> object:
+        self.call_log.append(f"send:{prompt!r}")
+        assert session_id == self.session_id, "must reuse the configured session"
+        assert directory == self.directory
+        pre_ids = frozenset(
+            message["info"]["id"]
+            for message in self.history
+            if message.get("info", {}).get("id")
+        )
+        n_user = sum(
+            1 for m in self.history if m["info"].get("role") == "user"
+        )
+        n_assistant = sum(
+            1 for m in self.history if m["info"].get("role") == "assistant"
+        )
+        user_id = f"u{n_user + 1}"
+        assistant_id = f"a{n_assistant + 1}"
+        created = 1000 + 200 * (n_user + n_assistant)
+        self.history.append(
+            user_message(user_id, prompt, created, session_id=session_id)
+        )
+        self.history.append(
+            assistant_message(
+                assistant_id,
+                created + 100,
+                completed=created + 200,
+                finish="stop",
+                parts=[text_part(f"answer {n_user + 1}")],
+                parent_id=user_id,
+                session_id=session_id,
+            )
+        )
+        return make_dispatch(
+            session_id=session_id,
+            directory=directory,
+            pre_ids=pre_ids,
+        )
+
+    def session_status(self, session_id: str, directory: str) -> str:
+        return self.status
+
+    def messages(self, session_id: str, directory: str) -> list[dict]:
+        return list(self.history)
+
+    def close(self) -> None:
+        pass
 
 
 # ---------------------------------------------------------------------- #
@@ -212,19 +293,93 @@ def test_response_message_type_rejected(tmp_path):
 # ---------------------------------------------------------------------- #
 
 
-def test_openchamber_flow_order_create_open_send(tmp_path):
+def test_openchamber_flow_order_confirm_open_send(tmp_path):
+    """The configured session is existence-checked first; the relay never
+    creates a session and only sends into the fixed, verified session."""
     oc = scripted_oc()
     wf = make_workflow(tmp_path, oc=oc)
     wf.process(v1_task(TARGET_OPENCHAMBER, "do it"))
     kinds = [call.split(":")[0] for call in oc.call_log if call != "opened"]
-    assert kinds == ["verify", "create", "open", "send"]
+    assert kinds == ["verify", "list", "open", "send"]
     # the deep-link request strictly precedes the send
     assert oc.call_log.index("open:ses_test123") < oc.call_log.index(
         "send:'do it'"
     )
-    # the session was created WITHOUT a prompt
-    create_call = next(c for c in oc.call_log if c.startswith("create:"))
-    assert "do it" not in create_call
+    # the relay must never create a session and never invent a title
+    assert not any(call.startswith("create:") for call in oc.call_log)
+
+
+def test_fixed_session_reused_across_two_rounds(tmp_path):
+    """Two consecutive tasks must use the SAME configured session: the
+    second continues the first round's context, only the second round's
+    final reply is returned, and no new session is created."""
+    oc = SharedContextOpenChamber()
+    wf = make_workflow(tmp_path, oc=oc, default=TARGET_OPENCHAMBER)
+    first = wf.process(v1_task(TARGET_OPENCHAMBER, "round 1", "task-r1"))
+    second = wf.process(v1_task(TARGET_OPENCHAMBER, "round 2", "task-r2"))
+
+    # round 2 was sent into the SAME configured session (context continues)
+    assert wf.registry.record("task-r1")["session_id"] == "ses_test123"
+    assert wf.registry.record("task-r2")["session_id"] == "ses_test123"
+    assert wf.outcome is not None and wf.outcome.session_id == "ses_test123"
+    # round 2 built on round 1's history in the session
+    assert len(oc.history) == 4  # u1 a1 u2 a2, one shared session
+    # each round returns ONLY its own final answer, never the other round's
+    assert "answer 1" in first
+    assert "answer 2" in second
+    assert "answer 1" not in second
+    # exactly two sends, and never a session create
+    assert sum(call.startswith("send:") for call in oc.call_log) == 2
+    assert not any(call.startswith("create:") for call in oc.call_log)
+    # round ids stay independent per task
+    assert parse_message(first).in_reply_to == "task-r1"
+    assert parse_message(second).in_reply_to == "task-r2"
+
+
+def test_openchamber_missing_session_id_fails_clearly(tmp_path):
+    """No configured session id: the task fails with a clear prompt and the
+    relay neither guesses a session nor creates one."""
+    oc = scripted_oc()
+    settings = RelaySettings(
+        default_target=TARGET_REASONIX, openchamber_directory="D:/proj"
+    )
+    wf = make_workflow(tmp_path, oc=oc, settings=settings)
+    with pytest.raises(RuntimeError, match="会话 ID 未配置"):
+        wf.process(v1_task(TARGET_OPENCHAMBER, "do it"))
+    assert oc.call_log == []  # OpenChamber was never touched
+    record = wf.registry.record("task-001")
+    assert record["state"] == "FAILED"
+    assert "missing session id" in record["error"]
+
+
+def test_configured_session_not_found_does_not_fallback(tmp_path):
+    """The configured session does not exist in the directory: clear error,
+    no send, and NEVER a fallback to another session."""
+    oc = scripted_oc()  # only knows ses_test123
+    settings = RelaySettings(
+        default_target=TARGET_REASONIX,
+        openchamber_directory="D:/proj",
+        openchamber_session_id="ses_gone",
+    )
+    wf = make_workflow(tmp_path, oc=oc, settings=settings)
+    with pytest.raises(RuntimeError, match="不存在"):
+        wf.process(v1_task(TARGET_OPENCHAMBER, "do it"))
+    assert not any(call.startswith("send:") for call in oc.call_log)
+    assert not any(call.startswith("create:") for call in oc.call_log)
+    record = wf.registry.record("task-001")
+    assert record["state"] == "FAILED"
+    assert record["session_id"] == "ses_gone"
+    assert wf.load_reply("task-001") is None
+
+
+def test_relay_settings_persist_session_id(tmp_path):
+    path = tmp_path / "relay_settings.json"
+    settings = RelaySettings(openchamber_session_id="ses_x")
+    settings.save(path)
+    assert RelaySettings.load(path).openchamber_session_id == "ses_x"
+    assert (
+        RelaySettings.load(tmp_path / "missing").openchamber_session_id == ""
+    )
 
 
 def test_openchamber_task_persisted_and_reply_stored(tmp_path):
@@ -277,6 +432,7 @@ def test_timeout_fails_and_keeps_session(tmp_path):
     settings = RelaySettings(
         default_target=TARGET_REASONIX,
         openchamber_directory="D:/proj",
+        openchamber_session_id="ses_test123",
         completion_timeout=0.05,
         poll_interval=0.01,
     )
@@ -312,6 +468,7 @@ def test_model_mismatch_reported_in_outcome(tmp_path):
     settings = RelaySettings(
         default_target=TARGET_REASONIX,
         openchamber_directory="D:/proj",
+        openchamber_session_id="ses_test123",
         openchamber_model="4090/qwen3.8-27b",
         completion_timeout=5.0,
         poll_interval=0.01,
@@ -350,6 +507,7 @@ def test_request_resolved_actual_mismatch_keeps_note(tmp_path):
     settings = RelaySettings(
         default_target=TARGET_REASONIX,
         openchamber_directory="D:/proj",
+        openchamber_session_id="ses_test123",
         openchamber_model="provA/modelA",
         completion_timeout=5.0,
         poll_interval=0.01,
@@ -479,6 +637,7 @@ def test_unanswered_question_times_out_keeps_session(tmp_path):
     settings = RelaySettings(
         default_target=TARGET_REASONIX,
         openchamber_directory="D:/proj",
+        openchamber_session_id="ses_test123",
         completion_timeout=0.3,
         poll_interval=0.01,
     )
@@ -496,20 +655,19 @@ def test_unanswered_question_times_out_keeps_session(tmp_path):
 # ---------------------------------------------------------------------- #
 
 
-def test_current_session_replaced_by_new_task(tmp_path):
-    """current_session follows the task now running; it is not the last
-    successful reply."""
-    oc = scripted_oc()
+def test_current_session_task_follows_running_task(tmp_path):
+    """current_session follows the task now running (same fixed session,
+    task identity changes); it is not the last successful reply."""
+    oc = SharedContextOpenChamber()
     wf = make_workflow(tmp_path, oc=oc)
     wf.process(v1_task(TARGET_OPENCHAMBER, "task A"))
     assert wf.current_session is not None
     assert wf.current_session.session_id == "ses_test123"
     assert wf.current_session.task_id == "task-001"
 
-    oc.next_session_id = "ses_B"
     wf.process(v1_task(TARGET_OPENCHAMBER, "task B", "task-002"))
     assert wf.current_session is not None
-    assert wf.current_session.session_id == "ses_B"
+    assert wf.current_session.session_id == "ses_test123"
     assert wf.current_session.task_id == "task-002"
     assert wf.outcome.task_id == "task-002"
 
@@ -520,6 +678,7 @@ def test_current_session_kept_after_timeout(tmp_path):
     settings = RelaySettings(
         default_target=TARGET_REASONIX,
         openchamber_directory="D:/proj",
+        openchamber_session_id="ses_test123",
         completion_timeout=0.05,
         poll_interval=0.01,
     )
@@ -568,6 +727,7 @@ def test_model_details_persisted_in_completion_record(tmp_path):
     settings = RelaySettings(
         default_target=TARGET_REASONIX,
         openchamber_directory="D:/proj",
+        openchamber_session_id="ses_test123",
         openchamber_model="4090/qwen3.8-27b",
         completion_timeout=5.0,
         poll_interval=0.01,
@@ -597,6 +757,7 @@ def test_model_mismatch_note_persists_even_when_task_fails(tmp_path):
     settings = RelaySettings(
         default_target=TARGET_REASONIX,
         openchamber_directory="D:/proj",
+        openchamber_session_id="ses_test123",
         openchamber_model="4090/qwen3.8-27b",
         completion_timeout=0.05,
         poll_interval=0.01,
