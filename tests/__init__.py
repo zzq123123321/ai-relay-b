@@ -1,0 +1,1 @@
+"""Make the tests directory a package so `tests.fakes` resolves."""

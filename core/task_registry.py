@@ -13,6 +13,8 @@ class TaskRegistryError(RuntimeError):
 
 
 class TaskRegistry:
+    EXTRA_FIELDS = frozenset({"executor", "session_id", "directory", "reply_file"})
+
     def __init__(self, path: Path | None = None):
         self.path = path or (data_dir() / "tasks.json")
         self._states = self._load()
@@ -20,10 +22,28 @@ class TaskRegistry:
     def contains(self, task_id: str) -> bool:
         return task_id in self._states
 
-    def mark(self, task_id: str, state: str, error: str | None = None) -> None:
-        record = {"state": state}
+    def record(self, task_id: str) -> dict[str, str] | None:
+        return self._states.get(task_id)
+
+    def mark(
+        self,
+        task_id: str,
+        state: str,
+        error: str | None = None,
+        **extra: str,
+    ) -> None:
+        existing = self._states.get(task_id, {})
+        record: dict[str, str] = {
+            field: value
+            for field, value in existing.items()
+            if field in self.EXTRA_FIELDS
+        }
+        record["state"] = state
         if error is not None:
             record["error"] = error
+        for field, value in extra.items():
+            if field in self.EXTRA_FIELDS and isinstance(value, str) and value:
+                record[field] = value
         self._states[task_id] = record
         self._save()
 
@@ -48,7 +68,8 @@ class TaskRegistry:
                 states[key] = {
                     field: item
                     for field, item in value.items()
-                    if field in {"state", "error"} and isinstance(item, str)
+                    if field in {"state", "error", *self.EXTRA_FIELDS}
+                    and isinstance(item, str)
                 }
             else:
                 raise TaskRegistryError("task registry has an invalid task record")
