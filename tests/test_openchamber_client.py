@@ -10,6 +10,9 @@ import requests
 from core.openchamber import (
     ModelRef,
     OpenChamberAuthError,
+    OpenChamberBadRequestError,
+    OpenChamberClient,
+    OpenChamberModelRequestRejectedError,
     OpenChamberSessionError,
     OpenChamberUnavailableError,
 )
@@ -55,6 +58,71 @@ def test_auth_error_401_tells_operator_to_configure_auth():
     client = make_client(http)
     with pytest.raises(OpenChamberAuthError, match="authentication"):
         client.verify()
+
+
+SEND_PATH = "/api/openchamber/sessions/ses_1/send"
+
+
+def _send_rejecting_http(detail: str) -> FakeHttp:
+    http = FakeHttp()
+    http.route("GET", MESSAGE_PATH, FakeResponse(200, []))
+    http.route("POST", SEND_PATH, FakeResponse(400, {"error": detail}))
+    return http
+
+
+def test_http_400_is_retryable_false_is_model_rejection():
+    """statusCode=400 + isRetryable=false is classified by the STRUCTURED
+    fields into a dedicated model-rejection error that keeps status_code,
+    is_retryable and request_url."""
+    detail = (
+        "APIError\nstatusCode: 400\nisRetryable: false\nresponseBody: \n"
+        "url: http://192.168.100.190:8080/v1/chat/completions"
+    )
+    client = make_client(_send_rejecting_http(detail))
+    with pytest.raises(OpenChamberModelRequestRejectedError) as ei:
+        client.send("ses_1", "do it", "D:/p")
+    exc = ei.value
+    assert exc.status_code == 400
+    assert exc.is_retryable is False
+    assert exc.request_url == "http://192.168.100.190:8080/v1/chat/completions"
+    assert "statusCode: 400" in str(exc)
+
+
+def test_http_400_is_retryable_true_stays_bad_request():
+    """A structured isRetryable=true 400 is a plain retryable bad request,
+    never a model rejection."""
+    detail = (
+        "APIError\nstatusCode: 400\nisRetryable: true\n"
+        "url: http://192.168.100.190:8080/v1/chat/completions"
+    )
+    client = make_client(_send_rejecting_http(detail))
+    with pytest.raises(OpenChamberBadRequestError) as ei:
+        client.send("ses_1", "do it", "D:/p")
+    assert not isinstance(ei.value, OpenChamberModelRequestRejectedError)
+
+
+def test_http_400_without_upstream_fields_is_not_blindly_rejected():
+    """An ordinary 400 with NO structured upstream fields stays a plain bad
+    request — the relay must never downgrade every 400 to a model rejection."""
+    client = make_client(_send_rejecting_http("bad prompt contents"))
+    with pytest.raises(OpenChamberBadRequestError) as ei:
+        client.send("ses_1", "do it", "D:/p")
+    assert not isinstance(ei.value, OpenChamberModelRequestRejectedError)
+
+
+def test_http_400_conservative_fallback_requires_full_upstream_signature():
+    """Without the isRetryable field, a 400 is only a model rejection when
+    the whole upstream APIError signature (marker + statusCode + url) is
+    present; a partial signature stays a plain bad request."""
+    full = "APIError\nstatusCode: 400\nurl: http://192.168.100.190:8080/v1/chat/completions"
+    client = make_client(_send_rejecting_http(full))
+    with pytest.raises(OpenChamberModelRequestRejectedError):
+        client.send("ses_1", "do it", "D:/p")
+
+    partial = "statusCode: 400\nurl: http://192.168.100.190:8080/v1/chat/completions"
+    client2 = make_client(_send_rejecting_http(partial))
+    with pytest.raises(OpenChamberBadRequestError):
+        client2.send("ses_1", "do it", "D:/p")
 
 
 def test_api_error_500_carries_server_message():
@@ -170,7 +238,7 @@ def test_send_posts_prompt_parses_real_shape_and_snapshots_first():
     assert body["prompt"] == "do it"
     assert body["directory"] == "D:/p"
     assert body["agent"] == "build"
-    assert body["model"] == {"providerID": "4090", "modelID": "qwen3.8-27b"}
+    assert body["model"] == "4090/qwen3.8-27b"
 
 
 def test_send_snapshot_failure_aborts_before_sending():
@@ -371,3 +439,228 @@ def test_session_exists_is_directory_membership():
     client = make_client(http)
     assert client.session_exists("ses_1", "D:/p") is True
     assert client.session_exists("ses_other", "D:/p") is False
+
+
+def test_list_sessions_with_projects_returns_triples_unfiltered():
+    http = FakeHttp()
+    http.route(
+        "GET",
+        "/api/session",
+        FakeResponse(
+            200,
+            [
+                {"id": "ses_1", "directory": "D:/p", "title": "One"},
+                {"id": "ses_2", "directory": None, "title": "Missing"},
+            ],
+        ),
+    )
+    client = make_client(http)
+    assert client.list_sessions_with_projects() == [
+        ("ses_1", "One", "D:/p"),
+        ("ses_2", "Missing", ""),
+    ]
+
+
+def test_list_sessions_with_projects_filtered_quotes_directory():
+    http = FakeHttp()
+    http.route(
+        "GET",
+        "/api/session?directory=D%3A%2Fp",
+        FakeResponse(200, [{"id": "ses_1", "directory": "D:/p", "title": "One"}]),
+    )
+    client = make_client(http)
+    assert client.list_sessions_with_projects("D:/p") == [("ses_1", "One", "D:/p")]
+
+
+def test_list_sessions_with_projects_non_list_fails():
+    http = FakeHttp()
+    http.route("GET", "/api/session", FakeResponse(200, {"x": 1}))
+    client = make_client(http)
+    with pytest.raises(OpenChamberSessionError, match="not a list"):
+        client.list_sessions_with_projects()
+
+
+def test_match_project_sessions_matches_normalized_paths():
+    all_sessions = [
+        ("ses_1", "One", r"D:\AIwork\跑跑卡丁车"),  # backslash form
+        ("ses_2", "Two", "d:/aiwork/跑跑卡丁车/"),  # forward slash + trailing slash
+        ("ses_3", "Other", "D:/aiwork/other"),
+        ("ses_4", "NoDir", ""),
+    ]
+    matched = OpenChamberClient.match_project_sessions(
+        "d:/AIWORK/跑跑卡丁车", all_sessions
+    )
+    assert matched == [("ses_1", "One"), ("ses_2", "Two")]
+
+
+def test_match_project_sessions_blank_or_none_matches_nothing():
+    all_sessions = [
+        ("ses_1", "One", r"D:\AIwork\跑跑卡丁车"),
+        ("ses_2", "NoDir", ""),
+    ]
+    assert OpenChamberClient.match_project_sessions("", all_sessions) == []
+    assert OpenChamberClient.match_project_sessions("  ", all_sessions) == []
+
+
+def test_extract_agent_model_sets_collects_agents_and_models():
+    from core.openchamber import extract_agent_model_sets
+
+    messages = [
+        user_message("u1", "hello", 1000),
+        assistant_message(
+            "a1", 1100, completed=1200, finish="stop",
+            parts=[text_part("ok")],
+            model=ModelRef("opencode", "big-pickle"),
+            agent="build",
+            parent_id="u1",
+        ),
+        assistant_message(
+            "a2", 1300, completed=1400, finish="stop",
+            parts=[text_part("ok")],
+            model=ModelRef("4090", "qwen3.8-27b"),
+            agent="plan",
+            parent_id="a1",
+        ),
+        assistant_message(
+            "a3", 1500, completed=1600, finish="error",
+            parts=[text_part("boom")],
+            agent=None,
+        ),
+    ]
+    agents, models = extract_agent_model_sets(messages)
+    assert agents == {"build", "plan"}
+    assert models == {"opencode/big-pickle", "4090/qwen3.8-27b"}
+
+
+def test_extract_agent_model_sets_empty_for_no_info():
+    from core.openchamber import extract_agent_model_sets
+
+    assert extract_agent_model_sets([]) == (set(), set())
+    assert extract_agent_model_sets([{"parts": []}]) == (set(), set())
+
+
+def test_send_model_string_roundtrip_preserves_requested_and_resolved():
+    """With the fix, send() posts model as the 'providerID/modelID' string
+    OpenChamber's resolveRequestedModel() expects.  When the server reports
+    the same model back, requested_model and resolved_model are identical."""
+    http = FakeHttp()
+    http.route(
+        "POST",
+        "/api/openchamber/sessions/ses_1/send",
+        FakeResponse(
+            200,
+            {
+                "action": "send",
+                "sessionId": "ses_1",
+                "directory": "D:/p",
+                "model": {"providerID": "4090", "modelID": "qwen3.8-27b"},
+                "agent": "build",
+                "promptDispatched": True,
+                "dispatchedAsCommand": False,
+            },
+        ),
+    )
+    http.route(
+        "GET",
+        MESSAGE_PATH,
+        FakeResponse(200, [user_message("u1", "old task", 500)]),
+    )
+    client = make_client(http)
+    dispatch = client.send(
+        "ses_1",
+        "do it",
+        "D:/p",
+        agent="build",
+        model=ModelRef("4090", "qwen3.8-27b"),
+    )
+    method, path, body = http.calls[-1]
+    assert method == "POST"
+    assert isinstance(body["model"], str)
+    assert body["model"] == "4090/qwen3.8-27b"
+    assert dispatch.requested_model == ModelRef("4090", "qwen3.8-27b")
+    assert dispatch.resolved_model == ModelRef("4090", "qwen3.8-27b")
+
+
+SNAPSHOT_PATH = "/api/permission-auto-accept"
+
+
+def test_auto_accept_snapshot_parses_sessions():
+    http = FakeHttp()
+    http.route(
+        "GET",
+        SNAPSHOT_PATH,
+        FakeResponse(
+            200,
+            {"sessions": {"ses_a": True, "ses_b": False, "ses_c": 1}, "revision": 3},
+        ),
+    )
+    client = make_client(http)
+    assert client.auto_accept_snapshot() == {
+        "ses_a": True,
+        "ses_b": False,
+        "ses_c": True,
+    }
+
+
+def test_auto_accept_snapshot_without_sessions_fails():
+    http = FakeHttp()
+    http.route("GET", SNAPSHOT_PATH, FakeResponse(200, {"revision": 1}))
+    client = make_client(http)
+    with pytest.raises(OpenChamberSessionError, match="no sessions"):
+        client.auto_accept_snapshot()
+
+
+def test_auto_accept_snapshot_unavailable():
+    http = FakeHttp()
+    http.raise_next = requests.ConnectionError("connection refused")
+    client = make_client(http)
+    with pytest.raises(OpenChamberUnavailableError, match="cannot reach"):
+        client.auto_accept_snapshot()
+
+
+def test_set_session_auto_accept_puts_quoted_id_and_directory():
+    http = FakeHttp()
+    http.route(
+        "PUT",
+        "/api/permission-auto-accept/sessions/ses_a%20b",
+        FakeResponse(200, {"sessions": {"ses_a b": True}}),
+    )
+    client = make_client(http)
+    result = client.set_session_auto_accept("ses_a b", True, "D:/p")
+    assert result == {"ses_a b": True}
+    assert (
+        "PUT",
+        "/api/permission-auto-accept/sessions/ses_a%20b",
+        {"enabled": True, "directory": "D:/p"},
+    ) in http.calls
+
+
+def test_set_session_auto_accept_without_directory_omits_it():
+    http = FakeHttp()
+    http.route(
+        "PUT",
+        "/api/permission-auto-accept/sessions/ses_1",
+        FakeResponse(200, {"sessions": {"ses_1": False}}),
+    )
+    client = make_client(http)
+    result = client.set_session_auto_accept("ses_1", False)
+    assert result == {"ses_1": False}
+    assert ("PUT", "/api/permission-auto-accept/sessions/ses_1", {"enabled": False}) in http.calls
+
+
+def test_set_session_auto_accept_empty_id_fails():
+    client = make_client(FakeHttp())
+    with pytest.raises(OpenChamberSessionError, match="must not be empty"):
+        client.set_session_auto_accept("", True)
+
+
+def test_set_session_auto_accept_without_sessions_fails():
+    http = FakeHttp()
+    http.route(
+        "PUT",
+        "/api/permission-auto-accept/sessions/ses_1",
+        FakeResponse(200, {"raw": "ok"}),
+    )
+    client = make_client(http)
+    with pytest.raises(OpenChamberSessionError, match="no sessions"):
+        client.set_session_auto_accept("ses_1", True, "D:/p")

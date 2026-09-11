@@ -37,6 +37,7 @@ class RelayMessage:
     protocol_format: ProtocolFormat = ProtocolFormat.V1
     round_number: int = 0
     max_rounds: int = 3
+    workdir: str | None = None
 
 
 def parse_message(text: str) -> RelayMessage:
@@ -90,6 +91,7 @@ def parse_message(text: str) -> RelayMessage:
         protocol_format=ProtocolFormat.V1,
         round_number=round_number,
         max_rounds=max_rounds,
+        workdir=fields.get("WORKDIR"),
     )
 
 
@@ -194,6 +196,7 @@ def _parse_legacy_web_message(text: str) -> RelayMessage:
         protocol_format=ProtocolFormat.LEGACY_WEB,
         round_number=round_number,
         max_rounds=max_rounds,
+        workdir=fields.get("WORKDIR"),
     )
 
 

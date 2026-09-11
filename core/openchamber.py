@@ -62,12 +62,96 @@ open the session; it does not prove the window displayed it.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
 import requests
+
+
+_LOG = logging.getLogger("ai_relay_b")
+
+
+# Shared registry of OpenChamber messages that have already been wrapped into
+# AI_RELAY responses.  Used by both the auto-relay path (via
+# :func:`mark_message_wrapped` after :func:`wait_for_completion`) and the
+# manual OpenChamber monitor to prevent double-wrapping the same reply.
+#
+# The consumption key is ``(session_id, message_id)``, NOT the message id
+# alone: OpenChamber message ids come from the server's per-session message
+# list and are not guaranteed globally unique across sessions.  Keying on the
+# message id by itself would let one session's wrapped reply suppress an
+# unrelated session's same-named message, so a reply is consumed under the
+# session it belongs to.
+_wrapped_message_ids: set[tuple[str, str]] = set()
+
+
+def mark_message_wrapped(msg_id: str, session_id: str = "") -> None:
+    """Record that an OpenChamber message has been wrapped into a response.
+
+    ``msg_id`` is consumed under ``session_id`` (the session the message
+    belongs to); an empty ``session_id`` keys the mark under no session and
+    is only used where no session context exists (never in the auto-relay /
+    monitor paths, which always know the session).
+    """
+    _wrapped_message_ids.add((session_id or "", msg_id))
+
+
+def is_message_wrapped(msg_id: str, session_id: str = "") -> bool:
+    """Check whether an OpenChamber message has already been wrapped."""
+    return (session_id or "", msg_id) in _wrapped_message_ids
+
+
+def reset_wrapped_message_ids() -> None:
+    """TEST-ONLY: drop the process-global wrapped-message registry.
+
+    Only tests call this (via the conftest autouse fixture) so that
+    ``mark_message_wrapped`` state can never leak from one test into the
+    next and test execution order becomes irrelevant.  Production flows must
+    NEVER clear the registry mid-run: the marks stay for the process lifetime
+    so no reply is ever double-wrapped.
+    """
+    _wrapped_message_ids.clear()
+
+
+# Number of consecutive polls that must show the SAME abnormal-idle state
+# before an interrupted continuation is confirmed (anti-flap protection for
+# brief idle blips during streaming).
+REQUIRED_IDLE_CONFIRMATIONS = 3
+# Structured status: the status request SUCCEEDED but the session is absent
+# from the returned map (the service only reports busy/retry entries).  On
+# the server side that means idle, but the client must never conflate it
+# with ``unknown`` (request failed / unparseable) nor with an explicit
+# ``idle`` entry: only a session that was ACTIVELY observed (busy/retry or
+# message growth) may be treated as idle once it disappears from the map.
+MISSING_FROM_STATUS_MAP = "missing_from_status_map"
+# Limited transport-layer reconnect for transient failures (SSE read timeout
+# / connection reset, surfaced as OpenChamberUnavailableError).  After this
+# many failures the wait escalates to an interrupted-continuation recovery.
+MAX_TRANSPORT_RETRIES = 2
+TRANSPORT_RETRY_DELAYS = (3.0, 8.0)
+
+# --- Manual "监听 OpenChamber" monitor ----------------------------------- #
+# The manual monitor never auto-resumes: it only DETECTS the abnormal idle
+# after ``MONITOR_ONLY_IDLE_CONFIRMATIONS`` identical polls and lets the
+# operator click "继续当前任务" once.  Transport failures are probed up to
+# ``MONITOR_MAX_TRANSPORT_RETRIES`` times (awaits the same delays as the
+# auto-relay path) before the state is reported as unknowable.
+MONITOR_ONLY_IDLE_CONFIRMATIONS = 3
+MONITOR_MAX_TRANSPORT_RETRIES = 2
+MONITOR_TRANSPORT_RETRY_DELAYS = (3.0, 8.0)
+# Sent to the ORIGINAL session when the operator continues a manually
+# monitored round.  The relay does not know the original task text here, so
+# the prompt only asks to resume from the interruption point.
+MONITOR_CONTINUE_PROMPT = (
+    "上一次执行可能在工具调用后的续接阶段中断。请从最后一个未完成步骤继续，"
+    "先检查已有文件和执行结果，不要重复已经完成的修改；"
+    "完成剩余工作并返回完整中文最终报告。"
+)
 
 
 class OpenChamberError(RuntimeError):
@@ -97,6 +181,69 @@ class OpenChamberTimeoutError(OpenChamberError):
     waiting for the user in the OpenChamber UI); the caller must keep the
     session id and ask the operator to check the session instead of
     resending.
+    """
+
+
+class OpenChamberBadRequestError(OpenChamberSessionError):
+    """A send request was rejected with HTTP 400.
+
+    The session may still be idle; the caller can safely continue or retry
+    once instead of discarding the task.
+    """
+
+
+class OpenChamberModelRequestRejectedError(OpenChamberSessionError):
+    """The upstream model service rejected the request.
+
+    Identified from STRUCTURED upstream fields relayed by OpenChamber (or a
+    conservative string fallback): ``statusCode == 400`` combined with
+    ``isRetryable == false``.  Retrying the same prompt in the SAME session
+    would very likely be rejected again (the request context is the
+    problem), so the relay never auto-recontinues these rounds; the operator
+    is offered a fresh-session retry instead.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        is_retryable: bool | None = None,
+        request_url: str | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.is_retryable = is_retryable
+        self.request_url = request_url
+
+
+class OpenChamberInterruptedError(OpenChamberSessionError):
+    """The round stopped without producing a complete final answer.
+
+    The session is idle but carries no usable completion (no reply, not
+    completed, absent finish, or no final text).  The operator may safely
+    ask the session to continue from where it stopped.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        session_id: str | None = None,
+        last_message_id: str | None = None,
+        last_finish: str | None = None,
+        reason: str | None = None,
+    ):
+        super().__init__(message)
+        self.session_id = session_id
+        self.last_message_id = last_message_id
+        self.last_finish = last_finish
+        self.reason = reason
+
+
+class OpenChamberCancelledError(OpenChamberError):
+    """The completion wait was cancelled by the operator.
+
+    The OpenChamber session itself is left untouched; the caller keeps it
+    running and switches to manual monitoring instead of deleting it.
     """
 
 
@@ -154,6 +301,7 @@ class OpenChamberDispatch:
     user_message_id: str | None = None
     pre_send_message_ids: frozenset[str] = field(default=frozenset())
     pre_send_snapshot_ok: bool = True
+    prompt_text: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +316,10 @@ class CompletionResult:
     requested_model: ModelRef | None
     resolved_model: ModelRef | None
     model_mismatch: bool
+    # The ids of ALL assistant messages in the verified round (including the
+    # final one).  Marked wrapped after the reply is packaged so the manual
+    # OpenChamber monitor never duplicates a relay-produced reply.
+    round_message_ids: tuple[str, ...] = ()
 
 
 def _model_from_dict(value: Mapping[str, Any] | None) -> ModelRef | None:
@@ -188,6 +340,64 @@ def _model_from_message_info(info: Mapping[str, Any] | None) -> ModelRef | None:
     if isinstance(provider, str) and provider and isinstance(model, str) and model:
         return ModelRef(provider_id=provider, model_id=model)
     return None
+
+
+def error_detail(error: Any) -> str:
+    """Return the useful message from OpenCode/OpenChamber error payloads."""
+    if not isinstance(error, Mapping):
+        return str(error)
+    direct = error.get("message")
+    if direct:
+        return str(direct)
+    data = error.get("data")
+    if isinstance(data, Mapping):
+        nested = data.get("message") or data.get("error")
+        if nested:
+            return str(nested)
+    return str(error.get("name") or "unknown error")
+
+
+def normalize_directory(path: str) -> str:
+    """Canonical, comparable form of a project directory path.
+
+    Case-insensitively normalizes separators, resolves ``.``/``..`` and
+    strips any trailing separator so ``D:\\proj/``, ``D:/proj`` and
+    ``D:\\proj`` all compare equal (Windows paths are compared without
+    case).
+    """
+    if not path or not path.strip():
+        return ""
+    return os.path.normcase(os.path.abspath(os.path.normpath(path.strip())))
+
+
+def _extract_message_agent(message: Mapping[str, Any]) -> str | None:
+    info = message.get("info")
+    if isinstance(info, Mapping):
+        agent = info.get("agent")
+        if isinstance(agent, str) and agent.strip():
+            return agent.strip()
+    return None
+
+
+def extract_agent_model_sets(
+    messages: Sequence[Mapping[str, Any]],
+) -> tuple[set[str], set[str]]:
+    """Collect distinct agent ids and ``providerID/modelID`` model refs from
+    session messages (used by the UI's "刷新 Agent/Model").
+    """
+    agents: set[str] = set()
+    models: set[str] = set()
+    for message in messages:
+        agent = _extract_message_agent(message)
+        if agent:
+            agents.add(agent)
+        info = message.get("info")
+        model = (
+            _model_from_message_info(info) if isinstance(info, Mapping) else None
+        ) or _model_from_dict(info.get("model") if isinstance(info, Mapping) else None)
+        if model is not None:
+            models.add(model.label())
+    return agents, models
 
 
 class OpenChamberClient:
@@ -309,6 +519,65 @@ class OpenChamberClient:
             sessions.append((session_id, title if isinstance(title, str) else ""))
         return sessions
 
+    def list_sessions_with_projects(
+        self, directory: str | None = None
+    ) -> list[tuple[str, str, str]]:
+        """Sessions as ``(session_id, title, project_directory)`` triples.
+
+        Unlike :meth:`list_sessions`, each item also carries the project
+        directory it was created under, so callers can match a project by
+        path client-side (for example when a server-side ``?directory=``
+        filter disagrees with the locally canonicalized path).  The
+        unfiltered form (``directory=None``) returns every session.
+        """
+        path = "/api/session"
+        if directory and directory.strip():
+            encoded = requests.utils.quote(directory, safe="")
+            path += f"?directory={encoded}"
+        payload = self._get_json(path)
+        if not isinstance(payload, list):
+            raise OpenChamberSessionError(
+                f"session list response is not a list: {type(payload).__name__}"
+            )
+        sessions: list[tuple[str, str, str]] = []
+        for item in payload:
+            if not isinstance(item, Mapping):
+                continue
+            session_id = item.get("id")
+            title = item.get("title")
+            project = item.get("directory")
+            if not isinstance(session_id, str) or not session_id:
+                continue
+            sessions.append(
+                (
+                    session_id,
+                    title if isinstance(title, str) else "",
+                    project if isinstance(project, str) else "",
+                )
+            )
+        return sessions
+
+    @staticmethod
+    def match_project_sessions(
+        project_directory: str,
+        all_sessions: Sequence[tuple[str, str, str]],
+    ) -> list[tuple[str, str]]:
+        """Client-side path-compatible filter of ``all_sessions``.
+
+        Compares each session's project directory (case-insensitively, with
+        normalized separators and trailing slashes stripped) against
+        ``project_directory``.  Used when a server-side filter returns
+        nothing even though the project really has sessions.
+        """
+        if not project_directory:
+            return []
+        key = normalize_directory(project_directory)
+        matched: list[tuple[str, str]] = []
+        for session_id, title, project in all_sessions:
+            if project and normalize_directory(project) == key:
+                matched.append((session_id, title))
+        return matched
+
     def session_exists(self, session_id: str, directory: str) -> bool:
         """Whether ``session_id`` exists under ``directory``.
 
@@ -321,6 +590,57 @@ class OpenChamberClient:
         return any(
             existing == session_id for existing, _title in self.list_sessions(directory)
         )
+
+    def auto_accept_snapshot(self) -> dict[str, bool]:
+        """Current per-session permission auto-accept flags.
+
+        ``GET /api/permission-auto-accept`` returns a snapshot whose
+        ``sessions`` member maps session ids to booleans (the ``revision``
+        field is ignored).  Used to inherit a policy onto a newly rotated
+        session.
+        """
+        payload = self._get_json("/api/permission-auto-accept")
+        sessions = payload.get("sessions") if isinstance(payload, Mapping) else None
+        if not isinstance(sessions, Mapping):
+            raise OpenChamberSessionError(
+                f"permission auto-accept snapshot has no sessions: {payload!r}"
+            )
+        return {
+            str(session_id): bool(enabled)
+            for session_id, enabled in sessions.items()
+            if isinstance(session_id, str)
+        }
+
+    def set_session_auto_accept(
+        self,
+        session_id: str,
+        enabled: bool,
+        directory: str | None = None,
+    ) -> dict[str, bool]:
+        """Set one session's permission auto-accept policy via PUT.
+
+        The response echoes a snapshot with the same shape as
+        :meth:`auto_accept_snapshot`.
+        """
+        if not session_id or not session_id.strip():
+            raise OpenChamberSessionError("session id must not be empty")
+        encoded = requests.utils.quote(session_id, safe="")
+        body: dict[str, Any] = {"enabled": bool(enabled)}
+        if directory and directory.strip():
+            body["directory"] = directory
+        payload = self._put_json(
+            f"/api/permission-auto-accept/sessions/{encoded}", body
+        )
+        sessions = payload.get("sessions") if isinstance(payload, Mapping) else None
+        if not isinstance(sessions, Mapping):
+            raise OpenChamberSessionError(
+                f"set auto-accept response has no sessions: {payload!r}"
+            )
+        return {
+            str(session_id): bool(flag)
+            for session_id, flag in sessions.items()
+            if isinstance(session_id, str)
+        }
 
     def _pre_send_snapshot(self, session_id: str, directory: str) -> tuple[frozenset[str], bool]:
         """Message ids already present in the session, taken before the send.
@@ -362,7 +682,7 @@ class OpenChamberClient:
         if agent:
             body["agent"] = agent
         if model is not None:
-            body["model"] = model.as_payload()
+            body["model"] = model.label()
         payload = self._post_json(
             f"/api/openchamber/sessions/{session_id}/send", body
         )
@@ -402,11 +722,52 @@ class OpenChamberClient:
             user_message_id=user_message_id,
             pre_send_message_ids=pre_ids,
             pre_send_snapshot_ok=snapshot_ok,
+            prompt_text=prompt,
         )
 
     # ------------------------------------------------------------------ #
     # status and messages
     # ------------------------------------------------------------------ #
+
+    def session_status_detail(self, session_id: str, directory: str) -> str:
+        """Return the session's status in the FULL client vocabulary.
+
+        ``idle`` -- an explicit idle entry (or, per OpenCode's status
+        service, a session id MISSING from the map, which the service
+        defines as idle); ``busy`` / ``retry`` -- reported verbatim;
+        ``missing_from_status_map`` -- the status request SUCCEEDED but the
+        session is absent from the returned map (the map only ever holds
+        busy/retry entries); ``unknown`` -- request parsed but the payload
+        is malformed (non-dict map, null entry, unrecognized type).
+        Transport-level failures (SSE read timeout / connection reset /
+        service down) and HTTP errors raise instead of returning a status:
+        they must be retried at the transport layer, never mistaken for
+        ``missing_from_status_map``.
+        """
+        encoded = requests.utils.quote(directory, safe="")
+        response = self._get_json(f"/api/session/status?directory={encoded}")
+        if not isinstance(response, dict):
+            return "unknown"
+        if session_id not in response:
+            return MISSING_FROM_STATUS_MAP
+        entry = response[session_id]
+        if entry is None:
+            return "unknown"
+        if isinstance(entry, str) and entry:
+            return entry if entry in ("idle", "busy", "retry") else "unknown"
+        if isinstance(entry, Mapping):
+            # The desktop fork wraps the value as ``{"type": "busy"}``; be
+            # tolerant of ``status`` / ``state`` keys from other versions so
+            # an object-shaped idle is never silently compared to "idle" as
+            # ``unknown``.  Non-whitelisted types (sleep/starting/... ) stay
+            # ``unknown`` and must NOT be treated as idle.
+            for key in ("type", "status", "state"):
+                status_type = entry.get(key)
+                if isinstance(status_type, str) and status_type:
+                    return (
+                        status_type if status_type in ("idle", "busy", "retry") else "unknown"
+                    )
+        return "unknown"
 
     def session_status(self, session_id: str, directory: str) -> str:
         """Return the session's status type.
@@ -417,24 +778,14 @@ class OpenChamberClient:
         busy/retry entries.  A session id PRESENT with a null value is
         malformed data and is ``unknown``.  Anything else (unrecognized
         type, malformed payload) is ``unknown`` and must never be treated as
-        idle or as success.
+        idle or as success.  Callers that must tell a vanished session apart
+        from an explicit idle entry use :meth:`session_status_detail`
+        (``missing_from_status_map`` vs ``idle`` vs ``unknown``).
         """
-        encoded = requests.utils.quote(directory, safe="")
-        response = self._get_json(f"/api/session/status?directory={encoded}")
-        if not isinstance(response, dict):
-            return "unknown"
-        if session_id not in response:
+        status = self.session_status_detail(session_id, directory)
+        if status == MISSING_FROM_STATUS_MAP:
             return "idle"
-        entry = response[session_id]
-        if entry is None:
-            return "unknown"
-        if isinstance(entry, str) and entry:
-            return entry if entry in ("idle", "busy", "retry") else "unknown"
-        if isinstance(entry, Mapping):
-            status_type = entry.get("type")
-            if isinstance(status_type, str) and status_type:
-                return status_type if status_type in ("idle", "busy", "retry") else "unknown"
-        return "unknown"
+        return status
 
     def messages(self, session_id: str, directory: str) -> list[dict[str, Any]]:
         encoded = requests.utils.quote(directory, safe="")
@@ -514,6 +865,80 @@ class OpenChamberClient:
             except Exception:
                 return {"raw": ""}
 
+    def _put_json(self, path: str, body: Mapping[str, Any]) -> Any:
+        try:
+            response = self._http.put(
+                f"{self.base_url}{path}", json=dict(body), timeout=self.timeout
+            )
+        except requests.RequestException as exc:
+            raise OpenChamberUnavailableError(
+                f"cannot reach OpenChamber at {self.base_url}: {exc}"
+            ) from exc
+        self._raise_for_api_status(response)
+        try:
+            return response.json()
+        except ValueError:
+            try:
+                return {"raw": response.text}
+            except Exception:
+                return {"raw": ""}
+
+    @staticmethod
+    def _extract_upstream_error(detail: str) -> dict[str, Any]:
+        """Best-effort extraction of the structured upstream fields that
+        OpenChamber relays for a rejected model-service request.
+
+        Recognizes both the plain ``APIError`` block (``statusCode`` /
+        ``isRetryable`` / ``url``) and the JSON form.  Returns a dict with
+        an entry only for fields that were actually present, so classification
+        never happens on guessed data.
+        """
+        result: dict[str, Any] = {}
+        if not detail:
+            return result
+        patterns = {
+            "status_code": r"(?:statusCode|[\"']statusCode[\"'])\s*[:=]\s*(\d+)",
+            "is_retryable": (
+                r"(?:isRetryable|[\"']isRetryable[\"'])\s*[:=]\s*(true|false)"
+            ),
+            "request_url": r"(?:url|[\"']url[\"'])\s*[:=]\s*(\S+)",
+        }
+        for field, pattern in patterns.items():
+            match = re.search(pattern, detail, flags=re.IGNORECASE)
+            if not match:
+                continue
+            raw = match.group(1)
+            if field == "is_retryable":
+                result[field] = raw.lower() == "true"
+            elif field == "status_code":
+                result[field] = int(raw)
+            else:
+                result[field] = raw
+        return result
+
+    @staticmethod
+    def _is_400_model_rejection(detail: str) -> dict[str, Any] | None:
+        """Classify an HTTP 400 as a model-request rejection or ``None``.
+
+        Structured detection is authoritative: the upstream relayed
+        ``isRetryable`` field decides.  When OpenChamber relays no structured
+        field at all, a CONSERVATIVE string fallback requires the full
+        upstream ``APIError`` signature (statusCode + url + the APIError
+        marker) before a 400 is treated as a model rejection — an ordinary
+        400 is never blindly downgraded to a rejection.
+        """
+        structured = OpenChamberClient._extract_upstream_error(detail)
+        if "is_retryable" in structured:
+            if structured["is_retryable"] is False:
+                return structured
+            return None
+        has_upstream_marker = (
+            "APIError" in detail
+            and structured.get("request_url")
+            and structured.get("status_code") == 400
+        )
+        return structured if has_upstream_marker else None
+
     @staticmethod
     def _raise_for_api_status(response: requests.Response) -> None:
         if response.status_code in (401, 403):
@@ -530,6 +955,19 @@ class OpenChamberClient:
                     detail = payload["error"]
             except ValueError:
                 detail = response.text[:300]
+            if response.status_code == 400:
+                rejected = OpenChamberClient._is_400_model_rejection(detail)
+                if rejected is not None:
+                    raise OpenChamberModelRequestRejectedError(
+                        "OpenChamber rejected the request (HTTP 400) because "
+                        f"the upstream model service rejected it: {detail}",
+                        status_code=rejected.get("status_code", 400),
+                        is_retryable=rejected.get("is_retryable"),
+                        request_url=rejected.get("request_url"),
+                    )
+                raise OpenChamberBadRequestError(
+                    f"OpenChamber rejected the request (HTTP 400): {detail}"
+                )
             raise OpenChamberSessionError(
                 f"OpenChamber returned HTTP {response.status_code}: {detail}"
             )
@@ -601,11 +1039,32 @@ def locate_round(
         for index in user_indexes
         if _message_id(messages[index]) not in dispatch.pre_send_message_ids
     ]
+    if len(candidates) > 1 and dispatch.prompt_text:
+        exact = [
+            index
+            for index in candidates
+            if _message_text(messages[index]) == dispatch.prompt_text
+        ]
+        if len(exact) == 1:
+            return exact[0], "ok"
     if len(candidates) > 1:
         return -1, "ambiguous"
     if not candidates:
         return -1, "not_found"
     return candidates[0], "ok"
+
+
+def _message_text(message: Mapping[str, Any]) -> str:
+    parts = message.get("parts")
+    if not isinstance(parts, Sequence) or isinstance(parts, (str, bytes)):
+        return ""
+    return "\n".join(
+        str(part.get("text"))
+        for part in parts
+        if isinstance(part, Mapping)
+        and part.get("type") == "text"
+        and isinstance(part.get("text"), str)
+    ).strip()
 
 
 def _message_created(message: Mapping[str, Any]) -> int | None:
@@ -702,6 +1161,66 @@ def _round_assistant_messages(
     return _strictly_order_round(round_messages)
 
 
+def _follow_continuation_chain(
+    messages: Sequence[Mapping[str, Any]],
+    round_messages: list[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """When the round's last assistant message has ``finish="tool-calls"``
+    (an interrupted tool-calls round), look ahead for the NEXT user message
+    in the session and include its chained assistant messages.
+
+    This handles the case where the monitor auto-continues the session:
+    the monitor's user message (U2) and assistant reply (A2) form a
+    separate round that is invisible to ``_round_assistant_messages`` (which
+    only follows ``parentID`` chains to the original anchor).  By detecting
+    ``tool-calls`` and extending the round, ``wait_for_completion`` can
+    find the final reply even when the monitor has continued the session."""
+    if not round_messages:
+        return round_messages
+    last = round_messages[-1]
+    info = last.get("info") if isinstance(last.get("info"), Mapping) else {}
+    finish = info.get("finish") if isinstance(info, Mapping) else None
+    if finish != "tool-calls":
+        return round_messages
+    # Find the position of the last assistant message in the session list.
+    last_id = _message_id(last)
+    last_index = -1
+    for idx, msg in enumerate(messages):
+        if _message_id(msg) == last_id:
+            last_index = idx
+            break
+    if last_index < 0:
+        return round_messages
+    # Find the next user message after the last assistant message.
+    next_user_index = -1
+    for idx in range(last_index + 1, len(messages)):
+        if _role(messages[idx]) == "user":
+            next_user_index = idx
+            break
+    if next_user_index < 0:
+        return round_messages
+    # Collect assistant messages chained to this next user message.
+    next_anchor_id = _message_id(messages[next_user_index])
+    if not next_anchor_id:
+        return round_messages
+    by_id = {_message_id(m): m for m in messages if _message_id(m)}
+    user_ids = {_message_id(m) for m in messages if _role(m) == "user"}
+    extra: list[Mapping[str, Any]] = []
+    for msg in messages[next_user_index + 1:]:
+        if _role(msg) != "assistant":
+            continue
+        result = _chain_result(msg, next_anchor_id, by_id, user_ids)
+        if result == "anchor":
+            extra.append(msg)
+        elif result == "unknown":
+            # Unverifiable chain in continuation: include anyway
+            # (the monitor's continuation is expected to chain cleanly).
+            extra.append(msg)
+    if extra:
+        return _strictly_order_round(round_messages + extra)
+    return round_messages
+
+
 def _strictly_order_round(
     round_messages: Sequence[Mapping[str, Any]],
 ) -> list[Mapping[str, Any]]:
@@ -790,6 +1309,358 @@ def _tool_call_names(message: Mapping[str, Any]) -> list[str]:
     return names
 
 
+@dataclass(frozen=True, slots=True)
+class MonitorScan:
+    """One manual OpenChamber monitor probe.
+
+    ``new_completed`` lists assistant replies that appeared after the
+    monitor baseline and are NOT already wrapped: each is a
+    ``(msg_id, text)`` pair, oldest first.  ``seen_ids`` is the full current
+    set of assistant message ids seen in the session (the new baseline).
+    ``completed_history_ids`` is the subset of those that are ALREADY fully
+    completed replies (``time.completed`` + ``finish==stop`` + non-empty
+    text); only those may seed the monitor's wrap baseline -- an assistant
+    message that is still streaming when the monitor starts must stay
+    eligible to wrap once it completes, so it must NOT enter the baseline.
+    """
+
+    new_completed: tuple[tuple[str, str], ...]
+    seen_ids: frozenset[str]
+    completed_history_ids: frozenset[str]
+
+
+def _message_completed(message: Mapping[str, Any]) -> bool:
+    """Whether a single assistant message is a fully completed reply.
+
+    Mirrors the real-stack rules used by :func:`wait_for_completion`: a
+    positive (non-bool) ``time.completed`` plus ``finish == "stop"``, no
+    error, and non-empty final text.  Synthetic / ignored text parts are
+    never answers.
+    """
+    info = message.get("info")
+    if not isinstance(info, Mapping):
+        return False
+    if _role(message) != "assistant":
+        return False
+    finished = (info.get("time") or {}).get("completed")
+    if not isinstance(finished, int) or isinstance(finished, bool) or finished <= 0:
+        return False
+    if info.get("finish") != "stop":
+        return False
+    if info.get("error"):
+        return False
+    return bool(_text_parts(message))
+
+
+def _monitor_completed_replies(
+    messages: Sequence[Mapping[str, Any]],
+    baseline: frozenset[str],
+    session_id: str = "",
+) -> tuple[tuple[str, str], ...]:
+    """Completed assistant replies newer than ``baseline``, oldest first.
+
+    Shared by :func:`monitor_scan` and :func:`monitor_probe` so the manual
+    monitor uses exactly one reply-extraction rule.  Already-wrapped replies
+    never enter the list (the UI's runtime dedup is a second, independent
+    guard).
+    """
+    ordered: list[tuple[int, str, str]] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        msg_id = _message_id(message)
+        if not msg_id:
+            continue
+        if _role(message) != "assistant":
+            continue
+        if msg_id in baseline or is_message_wrapped(msg_id, session_id):
+            continue
+        if not _message_completed(message):
+            continue
+        created = _message_created(message) or 0
+        ordered.append((created, msg_id, "\n".join(_text_parts(message)).strip()))
+    ordered.sort(key=lambda item: item[0])
+    return tuple((mid, text) for _created, mid, text in ordered if text)
+
+
+def monitor_scan(
+    client: "OpenChamberClient",
+    session_id: str,
+    directory: str,
+    baseline: frozenset[str] = frozenset(),
+) -> MonitorScan:
+    """Scan a session for new completed assistant replies.
+
+    Returns only replies that are newer than the ``baseline`` assistant ids
+    and not already wrapped (see :func:`is_message_wrapped`), oldest first
+    by recorded creation time.  ``seen_ids`` is every assistant message id
+    currently in the session; ``completed_history_ids`` is the subset that is
+    already a fully completed reply -- only that subset may seed the monitor
+    baseline, so a message still streaming at start stays wrappable later.
+    """
+    messages = client.messages(session_id, directory)
+    seen = set()
+    completed_history = set()
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        msg_id = _message_id(message)
+        if not msg_id or _role(message) != "assistant":
+            continue
+        seen.add(msg_id)
+        if _message_completed(message):
+            completed_history.add(msg_id)
+    new_completed = _monitor_completed_replies(messages, baseline, session_id)
+    return MonitorScan(
+        new_completed, frozenset(seen), frozenset(completed_history)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorMessageStat:
+    """Compact per-message summary used by the manual monitor's round
+    tracker.  ``text_length`` counts the real final text only (synthetic /
+    ignored parts excluded), ``tool_count`` counts tool parts."""
+
+    message_id: str
+    role: str | None
+    finish: str | None
+    completed_ts: int | None
+    text_length: int
+    tool_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorProbe:
+    """One manual-monitor probe over a session.
+
+    Like :class:`MonitorScan` it reports the new completed assistant replies
+    (for wrapping), plus the whole current message set with role/finish/
+    completion details and the session status -- everything the round
+    tracker needs to tell "new activity" from "history idle" and to confirm
+    an abnormal idle without a second HTTP round-trip.
+    """
+
+    new_completed: tuple[tuple[str, str], ...]
+    seen_ids: frozenset[str]
+    messages: tuple[MonitorMessageStat, ...]
+    status: str
+
+
+def monitor_probe(
+    client: "OpenChamberClient",
+    session_id: str,
+    directory: str,
+    baseline: frozenset[str] = frozenset(),
+) -> MonitorProbe:
+    """One manual-monitor probe: new completed replies + full message stats
+    + current session status (one messages call + one status call)."""
+    messages = client.messages(session_id, directory)
+    status = client.session_status(session_id, directory)
+    # Client-boundary normalization: only the exact statuses the tracker
+    # understands may flow in.  A session vanished from the status map is
+    # server-side idle (the tracker's own activity_observed precondition
+    # guards against counting a never-seen session), so it maps to "idle";
+    # anything else becomes "unknown" so the idle comparison can never
+    # silently match (or fail to match) on exotic types.
+    if status == MISSING_FROM_STATUS_MAP:
+        status = "idle"
+    elif not isinstance(status, str) or status not in ("idle", "busy", "retry"):
+        status = "unknown"
+    seen_ids: set[str] = set()
+    stats: list[MonitorMessageStat] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        msg_id = _message_id(message)
+        if not msg_id:
+            continue
+        seen_ids.add(msg_id)
+        info = message.get("info")
+        finish = info.get("finish") if isinstance(info, Mapping) else None
+        completed = (info.get("time") or {}).get("completed") if isinstance(info, Mapping) else None
+        if not isinstance(completed, int) or isinstance(completed, bool) or completed <= 0:
+            completed = None
+        finish = finish if isinstance(finish, str) else None
+        stats.append(
+            MonitorMessageStat(
+                message_id=msg_id,
+                role=_role(message),
+                finish=finish,
+                completed_ts=completed,
+                text_length=len("\n".join(_text_parts(message)) or ""),
+                tool_count=len(_tool_call_names(message)),
+            )
+        )
+    new_completed = _monitor_completed_replies(messages, baseline, session_id)
+    return MonitorProbe(new_completed, frozenset(seen_ids), tuple(stats), status)
+
+
+def _latest_assistant_stat(probe: MonitorProbe) -> MonitorMessageStat | None:
+    """The last assistant message in session order (the newest one)."""
+    latest = None
+    for stat in probe.messages:
+        if stat.role == "assistant":
+            latest = stat
+    return latest
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorStepOutcome:
+    """What one tracker step concluded."""
+
+    event: str  # "none" | "activity" | "idle_confirm" | "interrupted"
+    idle_confirmations: int
+    required_idle: int
+    last_message_id: str | None
+    last_finish: str | None
+    reason: str | None
+
+
+@dataclass(slots=True)
+class MonitorRoundTracker:
+    """Lightweight in-memory context for one manual "监听 OpenChamber" run.
+
+    Lives entirely on the monitor polling thread (never persisted).  It
+    distinguishes messages that appeared AFTER the monitor baseline from
+    history, tracks the current round's latest assistant signature and
+    confirms an abnormal idle only after ``required_idle`` consecutive,
+    IDENTICAL suspicious polls (busy/retry, new messages, growing text or a
+    changed finish all reset the counter).
+    """
+
+    session_id: str
+    directory: str
+    baseline_ids: set[str] = field(default_factory=set)
+    required_idle: int = MONITOR_ONLY_IDLE_CONFIRMATIONS
+    activity_observed: bool = False
+    last_message_id: str | None = None
+    last_text_length: int = 0
+    last_finish: str | None = None
+    last_tool_count: int = 0
+    idle_confirmations: int = 0
+    interruption_emitted: bool = False
+    last_status: str | None = None
+    last_seen_ids: set[str] = field(default_factory=set)
+    reset_reason: str | None = None
+
+    def reset_round(self, seen_ids: frozenset[str], reason: str | None = None) -> None:
+        """A round ended (a final reply was wrapped, or the operator
+        continued, or the monitor just started): every current message
+        becomes history and the wake-up conditions start cold.
+
+        ``reason`` is recorded for the ``relay.log`` audit trail so every
+        reset is explainable (monitor start / a real final reply was wrapped
+        / manual continue)."""
+        self.reset_reason = reason
+        self.baseline_ids = set(seen_ids)
+        self.last_seen_ids = set(seen_ids)
+        self.activity_observed = False
+        self.last_message_id = None
+        self.last_text_length = 0
+        self.last_finish = None
+        self.last_tool_count = 0
+        self.idle_confirmations = 0
+        self.interruption_emitted = False
+        self.last_status = None
+
+    def step(self, probe: MonitorProbe) -> MonitorStepOutcome:
+        """Advance detection over one probe.
+
+        ``event`` is ``"interrupted"`` once the abnormal idle is confirmed,
+        ``"idle_confirm"`` while it is still counting up, ``"activity"``
+        when the session produced fresh work, or ``"none"``.  A fully idle
+        history session never triggers anything (``activity_observed``).
+        """
+        status = probe.status
+        new_ids = probe.seen_ids - frozenset(self.last_seen_ids)
+        self.last_seen_ids = set(probe.seen_ids)
+        latest = _latest_assistant_stat(probe)
+        if latest is not None:
+            signature = (
+                latest.message_id,
+                latest.text_length,
+                latest.finish or "",
+                latest.tool_count,
+            )
+            previous = (
+                self.last_message_id,
+                self.last_text_length,
+                self.last_finish or "",
+                self.last_tool_count,
+            )
+            if signature != previous:
+                changed_same_message = self.last_message_id == latest.message_id
+                self.last_message_id = latest.message_id
+                self.last_text_length = latest.text_length
+                self.last_finish = latest.finish
+                self.last_tool_count = latest.tool_count
+                if changed_same_message and not new_ids:
+                    # Same message, different content: streaming/text growth.
+                    self.activity_observed = True
+                    self.interruption_emitted = False
+                    self.idle_confirmations = 0
+                    return self._outcome("activity", reason="activity_same_message_text_growth")
+        if new_ids:
+            # A brand-new message implies activity; absorb it first so the
+            # same block never counts as its own confirmation.
+            self.activity_observed = True
+            self.interruption_emitted = False
+            self.idle_confirmations = 0
+            return self._outcome("activity", reason="activity_new_message")
+        if status in ("busy", "retry"):
+            if status != self.last_status:
+                self.activity_observed = True
+            self.last_status = status
+            self.idle_confirmations = 0
+            self.interruption_emitted = False
+            return self._outcome("activity", reason=f"activity_status_{status}")
+        self.last_status = status
+        if status != "idle":
+            self.idle_confirmations = 0
+            return self._outcome("none", reason=f"status_{status!r}")
+        if not self.activity_observed:
+            self.idle_confirmations = 0
+            return self._outcome("none", reason="no_activity_since_baseline")
+        round_messages = [
+            stat for stat in probe.messages if stat.message_id not in self.baseline_ids
+        ]
+        round_assistants = [stat for stat in round_messages if stat.role == "assistant"]
+        round_latest = round_assistants[-1] if round_assistants else None
+        new_empty_assistant = any(
+            stat.role == "assistant" and stat.text_length == 0
+            for stat in round_assistants
+        )
+        tool_activity = any(stat.tool_count > 0 for stat in round_messages)
+        suspicion = (
+            (round_latest is not None and round_latest.finish == "tool-calls")
+            or new_empty_assistant
+            or (round_latest is not None and round_latest.completed_ts is None)
+            or (round_latest is not None and round_latest.finish is None)
+            or tool_activity
+        )
+        if not suspicion:
+            self.idle_confirmations = 0
+            return self._outcome("none", reason="idle_without_suspicion")
+        if self.interruption_emitted:
+            return self._outcome("none", reason="interruption_already_emitted")
+        self.idle_confirmations += 1
+        if self.idle_confirmations >= self.required_idle:
+            self.interruption_emitted = True
+            return self._outcome("interrupted", reason="monitor_idle_without_completed_reply")
+        return self._outcome("idle_confirm", reason="idle_confirm")
+
+    def _outcome(self, event: str, reason: str | None = None) -> MonitorStepOutcome:
+        return MonitorStepOutcome(
+            event=event,
+            idle_confirmations=self.idle_confirmations,
+            required_idle=self.required_idle,
+            last_message_id=self.last_message_id,
+            last_finish=self.last_finish,
+            reason=reason,
+        )
+
+
 def extract_final_text(round_messages: Sequence[Mapping[str, Any]]) -> str:
     """Final assistant text of the round.
 
@@ -805,6 +1676,26 @@ def extract_final_text(round_messages: Sequence[Mapping[str, Any]]) -> str:
     return "\n".join(texts).strip()
 
 
+def _sleep_interruptible(
+    seconds: float, cancel_event: threading.Event | None
+) -> None:
+    """Sleep up to ``seconds`` in small chunks so cancellation is responsive.
+
+    Raises :class:`OpenChamberCancelledError` as soon as ``cancel_event`` is
+    set; ``cancel_event=None`` keeps the original single blocking sleep.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise OpenChamberCancelledError("OpenChamber wait cancelled by user")
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise OpenChamberCancelledError("OpenChamber wait cancelled by user")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
+
+
 def wait_for_completion(
     client: OpenChamberClient,
     dispatch: OpenChamberDispatch,
@@ -812,6 +1703,7 @@ def wait_for_completion(
     poll_interval: float = 2.0,
     grace_seconds: float = 5.0,
     status_callback: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> CompletionResult:
     """Wait until this dispatch round finished and verify the final answer.
 
@@ -836,18 +1728,155 @@ def wait_for_completion(
     interaction goes away.  The real permission-popup flow is not verified
     on this stack; the pending signal is a candidacy hint, not a claim that
     approvals were validated.  Only the overall deadline stops the relay;
-    the session is kept and the backend keeps running.
+    the session is kept and the backend keeps running.  ``timeout <= 0``
+    means wait forever (no deadline); real errors (aborted, error, invalid
+    session) still fail normally.
+
+    A round that stops idle WITHOUT a usable answer (no reply, not
+    completed, an absent ``finish``, or no final text) raises
+    :class:`OpenChamberInterruptedError` — still an
+    ``OpenChamberSessionError``, but signalling that the caller may safely
+    ask the session to continue.  Ambiguous attribution, a never-recorded
+    prompt, aborted/error details and ``finish`` values other than
+    ``stop``/``tool-calls`` remain plain ``OpenChamberSessionError``
+    failures that must not be silently continued.
+
+    A session that DISAPPEARS from the status map (successful request,
+    empty/other-only map → ``missing_from_status_map``) is handled like an
+    idle stop ONLY after activity was observed first (busy/retry, a new
+    assistant message, text growth, a changed finish/tool count, or the
+    round being located): then a valid final reply completes the round
+    normally, while an abnormal round state (finish=None, not completed,
+    empty body, a final ``tool-calls`` without a valid follow-up) confirms
+    through the same consecutive-poll mechanism with reason
+    ``status_missing_after_activity``.  Before any activity is seen a
+    vanished session is simply waited on (never a stall), and transport
+    failures / unparseable responses stay ``unknown`` and never masquerade
+    as a vanished session.  This also makes the stall detectable with
+    ``timeout <= 0`` (no deadline).
+
+    When ``cancel_event`` is set the wait loop raises
+    :class:`OpenChamberCancelledError` (at the loop top or inside sleeps)
+    without touching the session, so the operator can stop waiting and keep
+    the session for manual monitoring.  Cancellation is a dedicated error,
+    never a reuse of the timeout path.
     """
     update = status_callback or (lambda _status: None)
-    deadline = time.monotonic() + timeout
+    deadline = (
+        float("inf")
+        if timeout <= 0
+        else time.monotonic() + timeout
+    )
     record_grace_deadline: float | None = None
     reply_grace_deadline: float | None = None
     incomplete_grace_deadline: float | None = None
+    missing_tool_grace_deadline: float | None = None
     last_seen_message_id: str | None = None
     saw_pending_user_action = False
+    # Activity precondition for counting a VANISHED session as a stall.
+    # ``wait_for_completion`` is only ever called for a dispatch the service
+    # accepted (a confirmed send: the prompt is recorded in the session), so
+    # the round is, by definition, active from the first poll.  A status map
+    # that never listed the session (service restart / status lag / degraded
+    # status endpoint) must therefore NOT mask a genuinely stuck round.
+    session_activity_observed = True
+    last_activity_signature: tuple | None = None
+    # Idle-interruption confirmation state.
+    idle_confirmations = 0
+    idle_signature: tuple | None = None
+    # Limited transport retry state, reset on every successful read.
+    transport_retry_count = 0
+    # Fakes may only implement session_status (missing → idle already);
+    # the real client provides the detailed vocabulary.
+    status_fn = getattr(client, "session_status_detail", None)
+    if status_fn is None:
+        status_fn = client.session_status
+
+    def _transport_failure(site: str) -> None:
+        """Handle a transient transport error (SSE timeout / connection
+        reset, surfaced as OpenChamberUnavailableError): retry up to
+        MAX_TRANSPORT_RETRIES with cancel-aware delays, then escalate to an
+        interrupted-continuation recovery.  Never re-POSTs the original task
+        and never creates a new session."""
+        nonlocal transport_retry_count
+        transport_retry_count += 1
+        if transport_retry_count <= MAX_TRANSPORT_RETRIES:
+            delay = TRANSPORT_RETRY_DELAYS[transport_retry_count - 1]
+            update(f"OpenChamber 连接暂时中断（{site}），正在重连（{transport_retry_count}/{MAX_TRANSPORT_RETRIES}）……")
+            _LOG.info(
+                "oc wait: transient connection error session=%s site=%s "
+                "transport_retry_count=%d/%d",
+                dispatch.session_id, site, transport_retry_count,
+                MAX_TRANSPORT_RETRIES,
+            )
+            _sleep_interruptible(delay, cancel_event)
+            return
+        update("OpenChamber 连接多次中断，准备检查任务是否需要续接……")
+        _LOG.warning(
+            "oc wait: transport retries exhausted session=%s site=%s "
+            "last_message_id=%s transport_retry_count=%d reason=transport_failure",
+            dispatch.session_id, site, last_seen_message_id,
+            transport_retry_count,
+        )
+        raise OpenChamberInterruptedError(
+            "OpenCode 工具续接中断：OpenChamber 连接在传输层多次中断"
+            f"（{site}），会话可能已进入 idle 但本轮没有有效最终回复",
+            session_id=dispatch.session_id,
+            last_message_id=last_seen_message_id,
+            last_finish=None,
+            reason="transport_failure",
+        )
+
+    def _note_idle_suspicion(reason: str, signature: tuple) -> None:
+        """Increment the idle-interruption confirmation counter, resetting it
+        when the observed abnormal-idle signature changes (busy, new
+        message, growing text, completed reply or a changed finish all reset
+        it).  Raises OpenChamberInterruptedError after REQUIRED
+        consecutive identical abnormal-idle polls."""
+        nonlocal idle_confirmations, idle_signature
+        if idle_signature is None or idle_signature != signature:
+            idle_signature = signature
+            idle_confirmations = 1
+            _LOG.info(
+                "oc wait: idle-interruption suspicion session=%s "
+                "reason=%s last_message_id=%s idle_confirmations=%d/%d",
+                dispatch.session_id, reason,
+                signature[1] if len(signature) > 1 else last_seen_message_id,
+                idle_confirmations, REQUIRED_IDLE_CONFIRMATIONS,
+            )
+            update(f"检测到疑似工具续接中断；异常 idle 连续确认：1/{REQUIRED_IDLE_CONFIRMATIONS}")
+            return
+        idle_confirmations += 1
+        _LOG.info(
+            "oc wait: idle-interruption confirmation session=%s reason=%s "
+            "idle_confirmations=%d/%d recovery_attempted=false",
+            dispatch.session_id, reason, idle_confirmations,
+            REQUIRED_IDLE_CONFIRMATIONS,
+        )
+        update(
+            f"异常 idle 连续确认：{idle_confirmations}/{REQUIRED_IDLE_CONFIRMATIONS}"
+        )
+        if idle_confirmations >= REQUIRED_IDLE_CONFIRMATIONS:
+            _LOG.warning(
+                "oc wait: interrupted idle confirmed session=%s reason=%s "
+                "last_message_id=%s last_finish=%s",
+                dispatch.session_id, reason,
+                signature[1] if len(signature) > 1 else last_seen_message_id,
+                signature[2] if len(signature) > 2 else None,
+            )
+            raise OpenChamberInterruptedError(
+                "OpenCode 工具续接中断：会话已进入 idle，但本轮没有有效最终回复"
+                f"（reason={reason}）",
+                session_id=dispatch.session_id,
+                last_message_id=signature[1] if len(signature) > 1 else last_seen_message_id,
+                last_finish=signature[2] if len(signature) > 2 else None,
+                reason=reason,
+            )
 
     while True:
-        if time.monotonic() > deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            raise OpenChamberCancelledError("OpenChamber wait cancelled by user")
+        if deadline != float("inf") and time.monotonic() > deadline:
             detail = (
                 "；若会话正等待你的问题/权限确认，仍可在 OpenChamber 中处理"
                 if saw_pending_user_action
@@ -860,18 +1889,28 @@ def wait_for_completion(
             )
 
         try:
-            status_type = client.session_status(
-                dispatch.session_id, dispatch.directory
-            )
+            status_type = status_fn(dispatch.session_id, dispatch.directory)
+        except OpenChamberModelRequestRejectedError:
+            # A non-retryable model rejection must never become an infinite
+            # wait; the relay handles it as a fresh-session retry instead.
+            raise
         except OpenChamberUnavailableError:
-            status_type = "unknown"
+            _transport_failure("session_status")
+            continue
         except OpenChamberError:
             status_type = "unknown"
+        transport_retry_count = 0
 
         if status_type in ("busy", "retry"):
+            # The service reports this session as working: it is, by
+            # definition, active.
+            session_activity_observed = True
+            idle_confirmations = 0
+            idle_signature = None
             record_grace_deadline = None
             reply_grace_deadline = None
             incomplete_grace_deadline = None
+            missing_tool_grace_deadline = None
             last_seen_message_id = None
             sleep_for = min(poll_interval, max(0.1, deadline - time.monotonic()))
             if client.round_has_pending_user_action(
@@ -883,33 +1922,65 @@ def wait_for_completion(
                 update(pending_user_action_prompt(dispatch.session_id))
             else:
                 saw_pending_user_action = False
-                update(
-                    "OpenChamber 正在执行（retry，上游重试中）…"
-                    if status_type == "retry"
-                    else "OpenChamber 正在执行（busy）…"
-                )
-            time.sleep(sleep_for)
+                if timeout <= 0:
+                    update("OpenChamber 正在工作中，无时间限制…")
+                else:
+                    update(
+                        "OpenChamber 正在工作中（retry 为上游重试）…"
+                        if status_type == "retry"
+                        else "OpenChamber 正在工作中…"
+                    )
+            _sleep_interruptible(sleep_for, cancel_event)
             continue
 
-        if status_type != "idle":
-            # Unrecognized status type or malformed payload: never treat as
-            # idle and never convert to success; keep waiting for the
-            # deadline.
-            time.sleep(min(poll_interval, max(0.1, deadline - time.monotonic())))
-            update("OpenChamber 状态未确认，等待中…")
+        if status_type == MISSING_FROM_STATUS_MAP and not session_activity_observed:
+            # The status request succeeded but the service does not report
+            # this session at all, and the wait never saw it work: this is
+            # NOT a stall (first polls, service restart, status lag) -- just
+            # wait for the deadline, never start idle confirmations.
+            idle_confirmations = 0
+            idle_signature = None
+            _sleep_interruptible(
+                min(poll_interval, max(0.1, deadline - time.monotonic())),
+                cancel_event,
+            )
+            update("OpenChamber status interface is not yet reporting this session, waiting…")
             continue
 
-        # idle: verify the message round before declaring completion.
+        if status_type not in ("idle", MISSING_FROM_STATUS_MAP):
+            # Unrecognized status type or malformed payload (transport
+            # failures raise earlier and retry at the transport layer): never
+            # treat as idle, never as a vanished session, never convert to
+            # success; keep waiting for the deadline.
+            idle_confirmations = 0
+            idle_signature = None
+            _sleep_interruptible(
+                min(poll_interval, max(0.1, deadline - time.monotonic())),
+                cancel_event,
+            )
+            update("OpenChamber status unconfirmed, waiting…")
+            continue
+
+        # idle -- or a session that vanished from the status map AFTER the
+        # wait observed it active: verify the message round before declaring
+        # completion (a vanished session with a valid final reply completes
+        # normally; one whose round is still abnormal confirms a stall).
+        status_is_missing = status_type == MISSING_FROM_STATUS_MAP
         try:
             messages = client.messages(dispatch.session_id, dispatch.directory)
+        except OpenChamberModelRequestRejectedError:
+            raise
         except OpenChamberUnavailableError:
-            time.sleep(min(poll_interval, max(0.1, deadline - time.monotonic())))
-            update("OpenChamber 连接中断，等待恢复…")
+            _transport_failure("messages")
             continue
         except OpenChamberError:
-            time.sleep(min(poll_interval, max(0.1, deadline - time.monotonic())))
+            _sleep_interruptible(
+                min(poll_interval, max(0.1, deadline - time.monotonic())),
+                cancel_event,
+            )
             update("OpenChamber 消息接口异常，等待中…")
             continue
+        transport_retry_count = 0
 
         user_index, location_error = locate_round(messages, dispatch)
         if location_error == "ambiguous":
@@ -926,7 +1997,7 @@ def wait_for_completion(
             if record_grace_deadline is None:
                 record_grace_deadline = time.monotonic() + grace_seconds
             if time.monotonic() < record_grace_deadline:
-                time.sleep(min(poll_interval, 0.5))
+                _sleep_interruptible(min(poll_interval, 0.5), cancel_event)
                 update("等待 OpenChamber 记录本轮任务…")
                 continue
             raise OpenChamberSessionError(
@@ -935,21 +2006,34 @@ def wait_for_completion(
                 "check the session"
             )
         record_grace_deadline = None
+        # The round is located: the user message (and its assistant round)
+        # exists in the session -- activity the vanished-status stall check
+        # may build on from now on.
+        session_activity_observed = True
 
         round_messages = _round_assistant_messages(
             messages, user_index, _message_id(messages[user_index])
         )
+        # When the round ends with finish="tool-calls" (interrupted tool
+        # execution), follow the continuation chain: the monitor may have
+        # auto-continued the session, creating a new user→assistant round
+        # that is invisible to _round_assistant_messages.  Extend the round
+        # so wait_for_completion can detect the final reply.
+        round_messages = _follow_continuation_chain(messages, round_messages)
         if not round_messages:
             if reply_grace_deadline is None:
                 reply_grace_deadline = time.monotonic() + grace_seconds
             if time.monotonic() < reply_grace_deadline:
-                time.sleep(min(poll_interval, 0.5))
+                _sleep_interruptible(min(poll_interval, 0.5), cancel_event)
                 update("等待 OpenChamber 开始执行…")
                 continue
-            raise OpenChamberSessionError(
-                "OpenChamber reports idle but the session has no assistant "
-                f"reply for this task (session {dispatch.session_id})"
+            _note_idle_suspicion(
+                "status_missing_after_activity"
+                if status_is_missing
+                else "no_assistant_reply",
+                ("no_assistant_reply", last_seen_message_id, None, 0),
             )
+            continue
         reply_grace_deadline = None
 
         last = round_messages[-1]
@@ -960,25 +2044,62 @@ def wait_for_completion(
             incomplete_grace_deadline = None
             last_seen_message_id = last_message_id
 
+        # Any change of the round's observable state (new assistant message,
+        # body growth, finish change, tool-call count change) is activity:
+        # it re-arms the "曾经活动" precondition and zeroes the idle
+        # confirmation counter (streaming / growth is not a stall).
+        _finished_marker = (
+            info.get("finish") if isinstance(info, Mapping) else None
+        )
+        _activity_signature = (
+            last_message_id,
+            _finished_marker,
+            len(extract_final_text(round_messages)),
+            sum(len(_tool_call_names(m)) for m in round_messages),
+        )
+        if (
+            last_activity_signature is not None
+            and _activity_signature != last_activity_signature
+        ):
+            session_activity_observed = True
+            idle_confirmations = 0
+            idle_signature = None
+            _LOG.info(
+                "oc wait: round activity change resets idle confirmations "
+                "session=%s last_message_id=%s",
+                dispatch.session_id, last_message_id,
+            )
+        last_activity_signature = _activity_signature
+
         if has_pending_user_action(round_messages):
             saw_pending_user_action = True
             update(pending_user_action_prompt(dispatch.session_id))
-            time.sleep(min(poll_interval, max(0.1, deadline - time.monotonic())))
+            _sleep_interruptible(
+                min(poll_interval, max(0.1, deadline - time.monotonic())),
+                cancel_event,
+            )
             continue
         saw_pending_user_action = False
 
         error = info.get("error") if isinstance(info, Mapping) else None
         if error:
-            detail = error.get("message") if isinstance(error, Mapping) else error
+            detail = error_detail(error)
+            if detail.strip().casefold() in {"bad request", "uri too long"}:
+                raise OpenChamberModelRequestRejectedError(
+                    "当前会话上下文过大，模型服务已拒绝请求: " + detail,
+                    status_code=414 if detail.strip().casefold() == "uri too long" else 400,
+                    is_retryable=False,
+                )
             raise OpenChamberSessionError(
                 f"OpenChamber task failed in session {dispatch.session_id}: "
-                f"{detail!r}"
+                f"{detail}"
             )
         completed_ts = (
             (info.get("time") or {}).get("completed")
             if isinstance(info, Mapping)
             else None
         )
+        finished_marker = info.get("finish") if isinstance(info, Mapping) else None
         completed = (
             isinstance(completed_ts, int)
             and not isinstance(completed_ts, bool)
@@ -988,13 +2109,17 @@ def wait_for_completion(
             if incomplete_grace_deadline is None:
                 incomplete_grace_deadline = time.monotonic() + grace_seconds
             if time.monotonic() < incomplete_grace_deadline:
-                time.sleep(min(poll_interval, 0.5))
+                _sleep_interruptible(min(poll_interval, 0.5), cancel_event)
                 update("等待 OpenChamber 本轮执行结束…")
                 continue
-            raise OpenChamberSessionError(
-                "OpenChamber reports idle but the last assistant message of "
-                f"this round is not completed (session {dispatch.session_id})"
+            final_len = len(extract_final_text(round_messages))
+            _note_idle_suspicion(
+                "status_missing_after_activity"
+                if status_is_missing
+                else "not_completed",
+                ("not_completed", last_message_id, finished_marker, final_len),
             )
+            continue
 
         finish = info.get("finish") if isinstance(info, Mapping) else None
         if finish == "length":
@@ -1002,7 +2127,44 @@ def wait_for_completion(
                 f"OpenChamber reply was truncated by the model output limit "
                 f"(session {dispatch.session_id}); this is not a success"
             )
+        if finish == "tool-calls":
+            if status_is_missing:
+                # The session vanished from the status map right after a
+                # tool-calls message and NO continuation reply followed:
+                # the tool continuation likely died with the session's
+                # status entry.  Give the follow-up a short grace, then
+                # confirm through the same 3-poll mechanism.
+                if missing_tool_grace_deadline is None:
+                    missing_tool_grace_deadline = time.monotonic() + grace_seconds
+                if time.monotonic() < missing_tool_grace_deadline:
+                    _sleep_interruptible(min(poll_interval, 0.5), cancel_event)
+                    update("OpenChamber 状态消失，等待工具后续回复…")
+                    continue
+                final_len = len(extract_final_text(round_messages))
+                _note_idle_suspicion(
+                    "status_missing_after_activity",
+                    ("missing_tool_calls", last_message_id, "tool-calls", final_len),
+                )
+                continue
+            if timeout <= 0:
+                update("OpenChamber 正在执行工具，无时间限制，等待后续回复…")
+            else:
+                update("OpenChamber 正在执行工具，等待后续回复…")
+            _sleep_interruptible(
+                min(poll_interval, max(0.1, deadline - time.monotonic())),
+                cancel_event,
+            )
+            continue
         if finish != "stop":
+            if finish is None:
+                final_len = len(extract_final_text(round_messages))
+                _note_idle_suspicion(
+                    "status_missing_after_activity"
+                    if status_is_missing
+                    else "finish_none",
+                    ("finish_none", last_message_id, None, final_len),
+                )
+                continue
             raise OpenChamberSessionError(
                 f"OpenChamber round ended abnormally (finish={finish!r}) in "
                 f"session {dispatch.session_id}"
@@ -1013,10 +2175,13 @@ def wait_for_completion(
             tool_calls.extend(_tool_call_names(message))
         final_text = extract_final_text(round_messages)
         if not final_text:
-            raise OpenChamberSessionError(
-                f"OpenChamber round finished but has no final text "
-                f"(session {dispatch.session_id})"
+            _note_idle_suspicion(
+                "status_missing_after_activity"
+                if status_is_missing
+                else "no_final_text",
+                ("no_final_text", last_message_id, "stop", 0),
             )
+            continue
 
         actual_model = _model_from_message_info(info if isinstance(info, Mapping) else None)
         reference_model = (
@@ -1036,4 +2201,9 @@ def wait_for_completion(
             requested_model=dispatch.requested_model,
             resolved_model=dispatch.resolved_model,
             model_mismatch=model_mismatch,
+            round_message_ids=tuple(
+                mid
+                for mid in (_message_id(m) for m in round_messages)
+                if mid
+            ),
         )

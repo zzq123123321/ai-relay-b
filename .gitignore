@@ -1,7 +1,12 @@
 __pycache__/
 *.py[cod]
 build/
+build_*/
 dist/
+dist_*/
+runtime_data_backup_*/
+prebuild_backup_*/
+ui_preview.png
 data/*.log
 data/tasks.json
 data/replies/

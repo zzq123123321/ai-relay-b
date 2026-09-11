@@ -29,8 +29,10 @@ def main():
         from PySide6.QtWidgets import QApplication
         from ui import RelayWindow
     except ImportError as exc:
+        from core.error_translator import translate_error
+
         raise RuntimeError(
-            "PySide6 is not installed; run: py -m pip install -r requirements.txt"
+            translate_error(f"AI Relay startup import failed: {exc}")
         ) from exc
 
     build_agents()

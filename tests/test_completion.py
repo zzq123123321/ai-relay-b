@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from core.openchamber import (
     ModelRef,
+    OpenChamberCancelledError,
+    OpenChamberInterruptedError,
+    OpenChamberModelRequestRejectedError,
     OpenChamberSessionError,
     OpenChamberTimeoutError,
     wait_for_completion,
@@ -84,7 +90,7 @@ def test_idle_with_user_but_no_assistant_reply_is_not_completion():
     fake = ScriptedOpenChamber()
     fake.status_timeline = []
     fake.message_timelines = [HISTORY + [user_message("u2", "new task", 1000)]]
-    with pytest.raises(OpenChamberSessionError, match="no assistant reply"):
+    with pytest.raises(OpenChamberSessionError, match="no_assistant_reply"):
         run(fake, new_round_dispatch())
 
 
@@ -123,6 +129,45 @@ def test_run_error_is_failure_with_detail():
     ]
     with pytest.raises(OpenChamberSessionError, match="provider down"):
         run(fake, new_round_dispatch())
+
+
+def test_nested_aborted_error_has_useful_detail():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [[
+        user_message("u2", "new task", 1000),
+        assistant_message(
+            "a2", 1100, completed=1200,
+            error={"name": "MessageAbortedError", "data": {"message": "Aborted"}},
+            parts=[], parent_id="u2",
+        ),
+    ]]
+    with pytest.raises(OpenChamberSessionError, match="Aborted"):
+        run(fake, new_round_dispatch(pre_ids=frozenset()))
+
+
+def test_exact_prompt_identifies_round_when_user_also_typed_manually():
+    prompt = "relay task\n\n[AI_RELAY_TASK_ID: task-001]"
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [[
+        user_message("u2", prompt, 1000),
+        assistant_message(
+            "a2", 1100, completed=1200, finish="stop",
+            parts=[text_part("relay answer")], parent_id="u2",
+        ),
+        user_message("u3", "继续", 1300),
+    ]]
+    dispatch = new_round_dispatch(pre_ids=frozenset())
+    dispatch = type(dispatch)(
+        **{
+            field: getattr(dispatch, field)
+            for field in dispatch.__dataclass_fields__
+            if field != "prompt_text"
+        },
+        prompt_text=prompt,
+    )
+    assert run(fake, dispatch).final_text == "relay answer"
 
 
 def test_indefinite_busy_times_out():
@@ -200,6 +245,99 @@ def test_only_final_message_text_is_used():
     assert result.tool_calls == ("bash",)
 
 
+def test_lone_tool_calls_finish_keeps_polling_then_succeeds():
+    """A completed assistant message with ``finish='tool-calls'`` is NOT an
+    error: the round is still producing tool results and more assistant
+    messages.  The relay must keep polling until a later 'stop' message
+    provides the real final text."""
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle", "idle"]
+    tool_calls_round = (
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1150, finish="tool-calls",
+                parts=[tool_part("bash", "completed", "x"), text_part("intermediate")],
+                parent_id="u2",
+            ),
+        ]
+    )
+    finished_round = (
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1150, finish="tool-calls",
+                parts=[tool_part("bash", "completed", "x"), text_part("intermediate")],
+                parent_id="u2",
+            ),
+            assistant_message(
+                "a3", 1200, completed=1300, finish="stop",
+                parts=[text_part("FINAL TEXT")], parent_id="u2",
+            ),
+        ]
+    )
+    fake.message_timelines = [tool_calls_round, finished_round]
+    statuses_seen: list[str] = []
+    result = wait_for_completion(
+        fake,
+        new_round_dispatch(),
+        5.0,
+        poll_interval=0.01,
+        grace_seconds=0.05,
+        status_callback=statuses_seen.append,
+    )
+    # the final text comes from the 'stop' message, never the tool-calls
+    # intermediate text
+    assert result.final_text == "FINAL TEXT"
+    assert result.tool_calls == ("bash",)
+    assert result.finish == "stop"
+    assert any("正在执行工具" in s for s in statuses_seen)
+
+
+def test_lone_tool_calls_finish_without_followup_times_out():
+    """If the model asked for tools and no new assistant message ever
+    arrives, the existing total timeout must fire instead of silently
+    succeeding on the tool-calls message."""
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1150, finish="tool-calls",
+                parts=[text_part("intermediate")], parent_id="u2",
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberTimeoutError, match="did not finish"):
+        wait_for_completion(
+            fake, new_round_dispatch(), 0.2,
+            poll_interval=0.01, grace_seconds=0.05,
+        )
+
+
+def test_unknown_finish_is_still_a_failure():
+    """An unrecognized finish reason must still be reported as an abnormal
+    completion; only 'tool-calls' and 'stop' are handled explicitly."""
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1200, finish="something-else",
+                parts=[text_part("done")], parent_id="u2",
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberSessionError, match="abnormally"):
+        run(fake, new_round_dispatch())
+
+
 def test_empty_final_text_is_reported_not_falls_back():
     """A final assistant message without text must fail (no fallback to an
     earlier message's text)."""
@@ -219,7 +357,7 @@ def test_empty_final_text_is_reported_not_falls_back():
             ),
         ]
     ]
-    with pytest.raises(OpenChamberSessionError, match="no final text"):
+    with pytest.raises(OpenChamberSessionError, match="no_final_text"):
         run(fake, new_round_dispatch())
 
 
@@ -245,7 +383,7 @@ def test_synthetic_text_part_is_excluded():
             ),
         ]
     ]
-    with pytest.raises(OpenChamberSessionError, match="no final text"):
+    with pytest.raises(OpenChamberSessionError, match="no_final_text"):
         run(fake, new_round_dispatch())
 
 
@@ -400,7 +538,7 @@ def test_assistant_attached_to_other_user_is_not_this_round():
             ),
         ]
     ]
-    with pytest.raises(OpenChamberSessionError, match="no assistant reply"):
+    with pytest.raises(OpenChamberSessionError, match="no_assistant_reply"):
         run(fake, new_round_dispatch())
 
 
@@ -529,7 +667,7 @@ def test_completed_must_be_positive_timestamp(completed):
             ),
         ]
     ]
-    with pytest.raises(OpenChamberSessionError, match="not completed"):
+    with pytest.raises(OpenChamberSessionError, match="not_completed"):
         run(fake, new_round_dispatch())
 
 
@@ -695,3 +833,251 @@ def test_pending_permission_tool_part_keeps_waiting():
     dispatch = new_round_dispatch(pre_ids=frozenset())
     result = run(fake, dispatch)
     assert result.final_text == "final"
+
+
+def test_timeout_zero_keeps_waiting_past_900s_then_succeeds(monkeypatch):
+    """completion_timeout=0 means wait forever: even after simulated clock
+    time far beyond the old 900s limit the relay keeps polling with busy and
+    succeeds when the round finally completes with finish=stop."""
+    import core.openchamber as oc_mod
+
+    clock = {"now": 0.0}
+
+    def fast_monotonic() -> float:
+        clock["now"] += 200.0
+        return clock["now"]
+
+    monkeypatch.setattr(oc_mod.time, "monotonic", fast_monotonic)
+
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["busy"] * 6 + ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1200, finish="stop",
+                parts=[text_part("finally done")], model=MODEL, parent_id="u2",
+            ),
+        ]
+    ]
+    statuses: list[str] = []
+    result = wait_for_completion(
+        fake,
+        new_round_dispatch(),
+        0.0,
+        poll_interval=0.01,
+        grace_seconds=0.05,
+        status_callback=statuses.append,
+    )
+    assert clock["now"] > 900.0
+    assert result.final_text == "finally done"
+    assert result.finish == "stop"
+    # busy status must report the unlimited wait instead of the old labels
+    assert any("无时间限制" in s for s in statuses)
+
+
+def test_timeout_zero_aborted_error_still_fails(monkeypatch):
+    """Cancelling the deadline must NOT mask real errors: an aborted /
+    errored round is still reported as a failure."""
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [[
+        user_message("u2", "new task", 1000),
+        assistant_message(
+            "a2", 1100, completed=1200,
+            error={"name": "MessageAbortedError", "data": {"message": "Aborted"}},
+            parts=[], parent_id="u2",
+        ),
+    ]]
+    with pytest.raises(OpenChamberSessionError, match="Aborted"):
+        wait_for_completion(
+            fake,
+            new_round_dispatch(pre_ids=frozenset()),
+            0.0,
+            poll_interval=0.01,
+            grace_seconds=0.05,
+        )
+
+
+# ------------------------------------------------------------------ #
+# interruption classification (recoverable vs must-not-continue) and
+# operator cancellation
+# ------------------------------------------------------------------ #
+
+
+def test_idle_no_reply_is_interrupted_error():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = []
+    fake.message_timelines = [HISTORY + [user_message("u2", "new task", 1000)]]
+    with pytest.raises(OpenChamberInterruptedError, match="no_assistant_reply"):
+        run(fake, new_round_dispatch())
+
+
+def test_not_completed_is_interrupted_error():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=None, finish=None,
+                parts=[text_part("still working")], parent_id="u2",
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberInterruptedError, match="not_completed"):
+        run(fake, new_round_dispatch())
+
+
+def test_finish_none_is_interrupted_error():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1200, finish=None,
+                parts=[text_part("partial")], parent_id="u2",
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberInterruptedError, match="finish_none"):
+        run(fake, new_round_dispatch())
+
+
+def test_no_final_text_is_interrupted_error():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1200, finish="stop",
+                parts=[text_part("")], parent_id="u2",
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberInterruptedError, match="no_final_text"):
+        run(fake, new_round_dispatch())
+
+
+def test_ambiguous_stays_plain_session_error():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            user_message("u_manual", "人工插入", 1001),
+            assistant_message(
+                "a2", 1100, completed=1200, finish="stop",
+                parts=[text_part("answer")], parent_id="u2",
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberSessionError, match="ambiguous") as excinfo:
+        run(fake, new_round_dispatch())
+    assert type(excinfo.value) is OpenChamberSessionError
+
+
+def test_length_finish_stays_plain_session_error():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1200, finish="length",
+                parts=[text_part("partial answer")], parent_id="u2",
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberSessionError, match="truncated") as excinfo:
+        run(fake, new_round_dispatch())
+    assert type(excinfo.value) is OpenChamberSessionError
+
+
+def test_aborted_error_stays_plain_session_error():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "new task", 1000),
+            assistant_message(
+                "a2", 1100, completed=1200,
+                error={"name": "MessageAbortedError", "data": {"message": "Aborted"}},
+                parts=[], parent_id="u2",
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberSessionError, match="OpenChamber task failed") as excinfo:
+        run(fake, new_round_dispatch())
+    assert type(excinfo.value) is OpenChamberSessionError
+
+@pytest.mark.parametrize("detail", ["Bad Request", "URI Too Long"])
+def test_oversized_context_error_offers_fresh_session_retry(detail):
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["idle"]
+    fake.message_timelines = [
+        HISTORY
+        + [
+            user_message("u2", "继续", 1000),
+            assistant_message(
+                "a2", 1100, completed=1200,
+                error={"name": "UnknownError", "data": {"message": detail}},
+                parts=[], parent_id="u2",
+            ),
+        ]
+    ]
+    with pytest.raises(OpenChamberModelRequestRejectedError) as excinfo:
+        run(fake, new_round_dispatch())
+    assert excinfo.value.is_retryable is False
+
+
+def test_cancel_event_aborts_wait_immediately():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["busy"]
+    fake.message_timelines = [[]]
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(OpenChamberCancelledError, match="cancelled by user"):
+        wait_for_completion(
+            fake,
+            new_round_dispatch(),
+            5.0,
+            poll_interval=0.01,
+            grace_seconds=0.05,
+            cancel_event=cancel,
+        )
+
+
+def test_cancel_event_interrupts_sleep_loop():
+    fake = ScriptedOpenChamber()
+    fake.status_timeline = ["busy"]
+    fake.message_timelines = [[]]
+    cancel = threading.Event()
+
+    def set_cancel():
+        time.sleep(0.02)
+        cancel.set()
+
+    thread = threading.Thread(target=set_cancel)
+    thread.start()
+    try:
+        with pytest.raises(OpenChamberCancelledError, match="cancelled by user"):
+            wait_for_completion(
+                fake,
+                new_round_dispatch(),
+                5.0,
+                poll_interval=0.05,
+                grace_seconds=0.05,
+                cancel_event=cancel,
+            )
+    finally:
+        thread.join()

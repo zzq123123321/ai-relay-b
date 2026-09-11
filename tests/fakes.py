@@ -12,6 +12,7 @@ from core.openchamber import (
     OpenChamberDispatch,
     OpenChamberSessionError,
     OpenChamberUnavailableError,
+    normalize_directory,
 )
 
 
@@ -58,6 +59,10 @@ class FakeHttp:
         self.calls.append(("POST", url.split("http://fake.local", 1)[-1], json))
         return self._dispatch("POST", url, json)
 
+    def put(self, url: str, json: dict | None = None, timeout: float = 0, **_kw: Any) -> FakeResponse:
+        self.calls.append(("PUT", url.split("http://fake.local", 1)[-1], json))
+        return self._dispatch("PUT", url, json)
+
     def close(self) -> None:
         pass
 
@@ -81,6 +86,7 @@ def make_dispatch(
     agent: str | None = None,
     dispatched: bool = True,
     prompt_error: str | None = None,
+    prompt_text: str | None = None,
 ) -> OpenChamberDispatch:
     return OpenChamberDispatch(
         session_id=session_id,
@@ -94,6 +100,7 @@ def make_dispatch(
         user_message_id=user_message_id,
         pre_send_message_ids=frozenset(pre_ids or ()),
         pre_send_snapshot_ok=snapshot_ok,
+        prompt_text=prompt_text,
     )
 
 
@@ -226,6 +233,23 @@ class ScriptedOpenChamber:
             existing == session_id
             for existing, _title in self.list_sessions(directory)
         )
+
+    def list_sessions_with_projects(self) -> list[tuple[str, str, str]]:
+        self.call_log.append("list_all")
+        return list(self.sessions)
+
+    def match_project_sessions(
+        self,
+        directory: str,
+        all_sessions: Sequence[tuple[str, str, str]],
+    ) -> list[tuple[str, str]]:
+        self.call_log.append(f"match:{directory}")
+        key = normalize_directory(directory or "")
+        return [
+            (session_id, title)
+            for session_id, title, session_dir in all_sessions
+            if session_dir and normalize_directory(session_dir) == key
+        ]
 
     def send(self, session_id, prompt, directory, agent=None, model=None) -> OpenChamberDispatch:
         self.call_log.append(f"send:{prompt!r}")
