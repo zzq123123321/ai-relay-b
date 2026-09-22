@@ -85,8 +85,9 @@ def build_priority_window(qapp, monkeypatch, tmp_path, monitor_fake, task_oc):
         openchamber_sessions={directory_key(str(tmp_path)): "ses_test123"},
         poll_interval=0.05,
         completion_timeout=0,  # no timeout: a busy session waits until cancelled
+        auto_compact_after_response=False,  # these tests pin send/exact-count flows
     )
-    monkeypatch.setattr(ui_mod, "OpenChamberClient", lambda url: monitor_fake)
+    monkeypatch.setattr(ui_mod, "OpenChamberClient", lambda url, **kwargs: monitor_fake)
     window = build_window(
         qapp, monkeypatch, tmp_path, settings=settings, openchamber=task_oc
     )

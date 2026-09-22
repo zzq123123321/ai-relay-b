@@ -324,7 +324,10 @@ class RelayWorkflow:
                 "RECOVERY_REQUIRED",
                 "无法事后核实该任务的执行结果（无 OpenChamber 会话记录），需人工检查",
             )
-        client = OpenChamberClient(self.settings.openchamber_url)
+        client = OpenChamberClient(
+            self.settings.openchamber_url,
+            auth_token=self.settings.openchamber_auth_token or None,
+        )
         try:
             update(f"正在核对遗留任务 {task_id[:12]}…")
             client.verify()
@@ -530,7 +533,10 @@ class RelayWorkflow:
     def _openchamber_client(self) -> OpenChamberClient:
         if self.openchamber is not None:
             return self.openchamber
-        return OpenChamberClient(self.settings.openchamber_url)
+        return OpenChamberClient(
+            self.settings.openchamber_url,
+            auth_token=self.settings.openchamber_auth_token or None,
+        )
 
     def _run_openchamber(
         self,
@@ -572,6 +578,17 @@ class RelayWorkflow:
                 update("正在确认 OpenChamber 会话")
                 if not client.session_exists(session_id, directory):
                     session_id = ""
+            if not session_id:
+                # No fixed session configured: follow the session the
+                # OpenChamber window is currently showing.
+                try:
+                    session_id = client.find_active_session_id(directory) or ""
+                except Exception:
+                    session_id = ""
+                if session_id and not client.session_exists(session_id, directory):
+                    session_id = ""
+                if session_id:
+                    update("已定位 OpenChamber 当前激活会话")
             if not session_id:
                 update("正在为项目创建 OpenChamber 会话")
                 title = f"AI Relay - {Path(directory).name or '项目'}"
@@ -1021,6 +1038,33 @@ class RelayWorkflow:
         self.pending_continue = None
         update("恢复成功，回复已包装并复制")
         return response
+
+    def compact_session(
+        self,
+        session_id: str,
+        directory: str,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> bool:
+        """Run OpenChamber's local ``/compact`` action for a session.
+
+        The desktop composer implements this action through the legacy
+        ``session.summarize`` API with the currently configured model.  A
+        False result never affects the already-delivered reply."""
+        update = status_callback or (lambda _status: None)
+        client = self._openchamber_client()
+        try:
+            update("正在向会话发送压缩请求")
+            model = ModelRef.parse(self.settings.openchamber_model or None)
+            client.compact(session_id, directory, model=model)
+        except Exception as exc:
+            _LOG.warning(
+                "compact dispatch failed session=%s directory=%s error=%s",
+                session_id, directory, exc,
+            )
+            update("发送压缩请求失败，跳过上下文压缩")
+            return False
+        update("当前会话上下文压缩完成")
+        return True
 
     def continue_openchamber_task(
         self,

@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPushButton,
-    QSpinBox,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -155,6 +155,50 @@ class RelayTask(QRunnable):
             self.signals.finished.emit()
 
 
+class CompactTaskSignals(QObject):
+    done = Signal(bool)
+    finished = Signal()
+
+
+class CompactTask(QRunnable):
+    """A post-reply first-class opencode compaction of one OpenChamber
+    session, run on a worker so the main thread never blocks.  The
+    compaction is dispatched through the dedicated
+    ``/api/session/{id}/compact`` API (never through the AI_RELAY protocol
+    formatter, never as a text prompt) and finishes before the next queued
+    task is allowed to start."""
+
+    def __init__(self, workflow: RelayWorkflow, session_id: str, directory: str):
+        super().__init__()
+        self.workflow = workflow
+        self.session_id = session_id
+        self.directory = directory
+        self.signals = CompactTaskSignals()
+
+    @Slot()
+    def run(self):
+        ok = False
+        try:
+            LOGGER.info(
+                "compact worker start session=%s directory=%s",
+                self.session_id, self.directory,
+            )
+            ok = self.workflow.compact_session(
+                self.session_id, self.directory, lambda _status: None
+            )
+            LOGGER.info(
+                "compact worker done session=%s ok=%s", self.session_id, ok
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "compact worker error session=%s error=%s", self.session_id, exc
+            )
+            ok = False
+        finally:
+            self.signals.done.emit(ok)
+            self.signals.finished.emit()
+
+
 class _StaleRecoverySignals(QObject):
     done = Signal(object)
     failed = Signal(str)
@@ -249,44 +293,18 @@ class NewSessionRetryTask(QRunnable):
             self.signals.finished.emit()
 
 
-class SessionListTask(QRunnable):
-    def __init__(self, url: str, directory: str):
-        super().__init__()
-        self.url = url
-        self.directory = directory
-        self.signals = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            client = OpenChamberClient(self.url)
-            sessions = client.list_sessions(self.directory)
-            if not sessions and self.directory:
-                # Server-side ?directory= filter returned nothing; fall back
-                # to fetching all sessions and matching by canonical path so
-                # a valid project with sessions is never reported empty.
-                all_sessions = client.list_sessions_with_projects()
-                sessions = client.match_project_sessions(
-                    self.directory, all_sessions
-                )
-            self.signals.sessions.emit(sessions)
-        except Exception as exc:
-            self.signals.failed.emit(str(exc))
-        finally:
-            self.signals.finished.emit()
-
-
 class RefreshMetaTask(QRunnable):
-    def __init__(self, url: str, directory: str):
+    def __init__(self, url: str, directory: str, auth_token: str | None = None):
         super().__init__()
         self.url = url
         self.directory = directory
+        self.auth_token = auth_token
         self.signals = WorkerSignals()
 
     @Slot()
     def run(self):
         try:
-            client = OpenChamberClient(self.url)
+            client = OpenChamberClient(self.url, auth_token=self.auth_token)
             sessions = client.list_sessions(self.directory)
             if not sessions and self.directory:
                 all_sessions = client.list_sessions_with_projects()
@@ -306,27 +324,6 @@ class RefreshMetaTask(QRunnable):
                 agents |= session_agents
                 models |= session_models
             self.signals.sessions.emit((agents, models))
-        except Exception as exc:
-            self.signals.failed.emit(str(exc))
-        finally:
-            self.signals.finished.emit()
-
-
-class CreateSessionTask(QRunnable):
-    def __init__(self, url: str, title: str, directory: str):
-        super().__init__()
-        self.url = url
-        self.title = title
-        self.directory = directory
-        self.signals = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            session_id = OpenChamberClient(self.url).create_session(
-                self.title, self.directory
-            )
-            self.signals.succeeded.emit(session_id)
         except Exception as exc:
             self.signals.failed.emit(str(exc))
         finally:
@@ -359,7 +356,10 @@ class RotateSessionTask(QRunnable):
         try:
             rotation = SessionRotation(
                 settings=self.settings,
-                openchamber=OpenChamberClient(self.url),
+                openchamber=OpenChamberClient(
+                    self.url,
+                    auth_token=self.settings.openchamber_auth_token or None,
+                ),
             )
             session_id = rotation.rotate(
                 self.directory,
@@ -740,6 +740,7 @@ class MonitorContinueTask(QRunnable):
         directory: str,
         agent: str | None = None,
         model=None,
+        auth_token: str | None = None,
     ):
         super().__init__()
         self.url = url
@@ -747,12 +748,13 @@ class MonitorContinueTask(QRunnable):
         self.directory = directory
         self.agent = agent
         self.model = model
+        self.auth_token = auth_token
         self.signals = WorkerSignals()
 
     @Slot()
     def run(self):
         try:
-            client = OpenChamberClient(self.url)
+            client = OpenChamberClient(self.url, auth_token=self.auth_token)
             self.signals.status.emit(
                 f"正在向会话 {self.session_id} 发送续接提示……"
             )
@@ -796,6 +798,7 @@ class MonitorAutoContinueTask(QRunnable):
         model=None,
         interval: float = _MONITOR_AUTO_CONTINUE_INTERVAL,
         stop_event=None,
+        auth_token: str | None = None,
     ):
         super().__init__()
         self.url = url
@@ -805,6 +808,7 @@ class MonitorAutoContinueTask(QRunnable):
         self.model = model
         self.interval = float(interval)
         self.stop_event = stop_event
+        self.auth_token = auth_token
         self.signals = self.Signals()
 
     @Slot()
@@ -814,7 +818,7 @@ class MonitorAutoContinueTask(QRunnable):
                 return  # operator stopped before the wait elapsed
             if self.stop_event is not None and self.stop_event.is_set():
                 return
-            client = OpenChamberClient(self.url)
+            client = OpenChamberClient(self.url, auth_token=self.auth_token)
             self.signals.status.emit(f"正在自动续接会话 {self.session_id}……")
             client.send(
                 self.session_id,
@@ -854,6 +858,7 @@ class MonitorRecoveryQueryTask(QRunnable):
         retries: int = MONITOR_MAX_TRANSPORT_RETRIES,
         delays=MONITOR_TRANSPORT_RETRY_DELAYS,
         stop_event=None,
+        auth_token: str | None = None,
     ):
         super().__init__()
         self.url = url
@@ -863,6 +868,7 @@ class MonitorRecoveryQueryTask(QRunnable):
         self.retries = int(retries)
         self.delays = tuple(delays)
         self.stop_event = stop_event
+        self.auth_token = auth_token
         self.signals = self.Signals()
 
     @Slot()
@@ -873,7 +879,7 @@ class MonitorRecoveryQueryTask(QRunnable):
             self.signals.finished.emit()
 
     def _pump(self):
-        client = OpenChamberClient(self.url)
+        client = OpenChamberClient(self.url, auth_token=self.auth_token)
         for attempt in range(self.retries):
             if self.stop_event is not None and self.stop_event.is_set():
                 self.signals.result.emit("no_progress")
@@ -916,12 +922,13 @@ class RelayWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("AI Relay")
         self.setMinimumSize(680, 620)
+        self.resize(760, 980)
 
         self._busy = False
+        self._compacting = False
         self._app = app
         self._clipboard_paused = False
-        self._pending_session_id = ""
-        self._startup_check_pending = True
+        self._startup_check_pending = False
         self._task_cancel_event: threading.Event | None = None
         self._refresh_session_after_success = False
         self._current_task_is_auto = False
@@ -930,6 +937,9 @@ class RelayWindow(QMainWindow):
         self._pool = pool or QThreadPool.globalInstance()
         self._reasonix = ReasonixAutomation()
         self._settings = RelaySettings.load()
+        self._startup_check_pending = (
+            self._settings.default_target == TARGET_REASONIX
+        )
         self._workflow = RelayWorkflow(
             self._reasonix, settings=self._settings
         )
@@ -1095,11 +1105,17 @@ class RelayWindow(QMainWindow):
         layout.addWidget(self._build_actions_group())
         layout.addWidget(self._build_settings_group())
         layout.addWidget(self._build_results_group())
-        layout.addStretch()
 
         container = QWidget()
         container.setLayout(layout)
-        self.setCentralWidget(container)
+        # Scrollable center: on short screens the groups used to be squeezed
+        # and the last settings rows (e.g. 自动压缩会话) vanished; now the
+        # full content is always reachable.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setWidget(container)
+        self.setCentralWidget(scroll)
         self._apply_styles()
 
         self.start_button.clicked.connect(self._start)
@@ -1114,13 +1130,10 @@ class RelayWindow(QMainWindow):
         self.recopy_button.clicked.connect(self._recopy_reply)
         self._saved_task_combo.currentIndexChanged.connect(self._saved_task_selected)
         self._save_settings_button.clicked.connect(self._save_settings)
-        self._refresh_sessions_button.clicked.connect(self._refresh_sessions)
-        self._create_session_button.clicked.connect(self._create_session)
-        self._auto_rotate_check.toggled.connect(self._on_auto_rotate_toggled)
-        self._session_combo.activated.connect(self._on_session_manual_switch)
 
         QTimer.singleShot(0, self._ensure_clipboard_listener_started)
-        QTimer.singleShot(0, self._self_check)
+        if self._startup_check_pending:
+            QTimer.singleShot(0, self._self_check)
         QTimer.singleShot(0, self._maybe_start_startup_recovery)
 
     # ------------------------------------------------------------------ #
@@ -1237,48 +1250,14 @@ class RelayWindow(QMainWindow):
         agent_model_row.addWidget(self._model_combo)
         agent_model_row.addWidget(self._refresh_meta_button)
 
-        self._session_combo = QComboBox()
-        self._session_combo.setEditable(True)
-        self._session_combo.setInsertPolicy(QComboBox.NoInsert)
-        self._session_combo.setMinimumWidth(220)
-        self._session_combo.addItem("— 未配置会话 —", None)
-        configured_session = self._settings.openchamber_session_id.strip()
-        if configured_session:
-            self._session_combo.setCurrentText(configured_session)
-        self._refresh_sessions_button = QPushButton("刷新会话列表")
-        self._create_session_button = QPushButton("新建会话")
-        session_row = QHBoxLayout()
-        session_row.addWidget(self._session_combo)
-        session_row.addWidget(self._refresh_sessions_button)
-        session_row.addWidget(self._create_session_button)
-
         form.addRow("默认执行端（TARGET: EXECUTOR）", self._executor_combo)
         form.addRow("OpenChamber 地址", self._url_edit)
         form.addRow("项目目录", directory_row)
         form.addRow("Agent / Model", agent_model_row)
-        form.addRow("会话 ID（已有会话，不自动创建）", session_row)
 
-        self._auto_rotate_check = QCheckBox("自动轮换会话")
-        self._auto_rotate_check.setChecked(self._settings.auto_rotate_enabled)
-        self._auto_rotate_threshold_spin = QSpinBox()
-        self._auto_rotate_threshold_spin.setRange(1, 100)
-        self._auto_rotate_threshold_spin.setValue(self._settings.auto_rotate_threshold)
-        self._auto_rotate_threshold_spin.setEnabled(
-            self._settings.auto_rotate_enabled
-        )
-        self._auto_rotate_inherit_check = QCheckBox("新会话继承自动接受权限")
-        self._auto_rotate_inherit_check.setChecked(
-            self._settings.auto_rotate_inherit_auto_accept
-        )
-        self._auto_rotate_inherit_check.setEnabled(
-            self._settings.auto_rotate_enabled
-        )
-        rotate_row = QHBoxLayout()
-        rotate_row.addWidget(self._auto_rotate_threshold_spin)
-        rotate_row.addWidget(QLabel("次后自动轮换"))
-        form.addRow(self._auto_rotate_check)
-        form.addRow("完成任务数", rotate_row)
-        form.addRow("", self._auto_rotate_inherit_check)
+        self._auto_compact_check = QCheckBox("任务完成后自动压缩会话")
+        self._auto_compact_check.setChecked(self._settings.auto_compact_after_response)
+        form.addRow(self._auto_compact_check)
 
         self._save_settings_button = QPushButton("保存设置")
         form.addRow(self._save_settings_button)
@@ -1456,7 +1435,9 @@ class RelayWindow(QMainWindow):
             self._show_error("请先在设置中选择或填写 OpenChamber 会话 ID")
             return
 
-        client = OpenChamberClient(url)
+        client = OpenChamberClient(
+            url, auth_token=self._settings.openchamber_auth_token or None
+        )
         try:
             if not client.session_exists(session_id, directory):
                 self._show_error(
@@ -1737,6 +1718,7 @@ class RelayWindow(QMainWindow):
             model=self._settings.openchamber_model_ref(),
             interval=self._monitor_auto_continue_interval,
             stop_event=self._oc_monitor_stop,
+            auth_token=self._settings.openchamber_auth_token or None,
         )
         task.signals.status.connect(
             lambda s, g=generation: self._guard(g, self._set_status, s)
@@ -1814,6 +1796,7 @@ class RelayWindow(QMainWindow):
             reference_message_id=self._oc_monitor_last_stall_message_id,
             delays=self._monitor_transport_delays,
             stop_event=self._oc_monitor_stop,
+            auth_token=self._settings.openchamber_auth_token or None,
         )
         generation = self._monitor_generation
         task.signals.result.connect(
@@ -1968,6 +1951,42 @@ class RelayWindow(QMainWindow):
         self.detail_label.setText(
             f"OpenChamber 手动回复已包装（任务 {task_id[:12]}…）并复制到剪贴板。"
         )
+        self._maybe_auto_compact_after_monitor_reply()
+
+    def _maybe_auto_compact_after_monitor_reply(self):
+        """Compact the monitored OpenChamber session after a manual/monitor
+        reply was wrapped and copied, mirroring the auto-compact performed on
+        the A-side task lane.  Runs on a worker and only touches the
+        ``_compacting`` flag (the monitor path owns no task lane)."""
+        if not getattr(
+            self._settings, "auto_compact_after_response", False
+        ) or self._compacting:
+            return
+        if not (
+            self._oc_monitor_session
+            and self._oc_monitor_directory
+        ):
+            return
+        self._compacting = True
+        self._set_status("回复已复制；正在压缩当前会话上下文…")
+        task = CompactTask(
+            self._workflow,
+            self._oc_monitor_session,
+            self._oc_monitor_directory,
+        )
+        task.signals.done.connect(self._on_monitor_compact_done)
+        self._track_general_worker(task)
+
+    @Slot(bool)
+    def _on_monitor_compact_done(self, ok: bool):
+        self._compacting = False
+        if ok:
+            self.detail_label.setText("回复已复制；当前会话上下文压缩完成。")
+        else:
+            LOGGER.warning("监听模式 auto compact failed after a reply")
+            self.detail_label.setText(
+                "回复已完成并复制，但上下文压缩失败；不影响已完成的回复。"
+            )
 
     @Slot(str)
     def _on_monitor_failed(self, error: str):
@@ -2386,6 +2405,7 @@ class RelayWindow(QMainWindow):
             directory=self._oc_monitor_directory,
             agent=self._settings.openchamber_agent.strip() or None,
             model=self._settings.openchamber_model_ref(),
+            auth_token=self._settings.openchamber_auth_token or None,
         )
         generation = self._monitor_generation
         task.signals.status.connect(
@@ -2560,14 +2580,75 @@ class RelayWindow(QMainWindow):
         self.detail_label.setText(detail)
         if self._refresh_session_after_success:
             # A successful fresh-session retry adopted a NEW OpenChamber
-            # session: reflect it in the session selector and refresh the list.
+            # session: just surface the switch (the session selector is gone).
             self._refresh_session_after_success = False
-            session_id = outcome.session_id if outcome is not None else None
-            if session_id:
-                self._adopt_openchamber_session(session_id)
+            if outcome is not None and outcome.session_id:
+                self._set_status("已切换到新会话")
             if outcome is not None and outcome.directory:
                 self._rotation.reset(outcome.directory)
+        if (
+            getattr(self._settings, "auto_compact_after_response", False)
+            and not self._compacting
+            and outcome is not None
+            and outcome.executor == TARGET_OPENCHAMBER
+            and outcome.session_id
+            and outcome.directory
+        ):
+            # Reply is wrapped and clipped BEFORE this point; the compact lane
+            # keeps the task busy so new A-side tasks only queue, and the next
+            # queued task starts only after the compaction completes (or fails).
+            LOGGER.info(
+                "auto compact trigger session=%s directory=%s setting=%s",
+                outcome.session_id, outcome.directory,
+                getattr(self._settings, "auto_compact_after_response", False),
+            )
+            self._start_auto_compact(outcome, rotation_trigger)
+            return
+        if not getattr(self._settings, "auto_compact_after_response", False):
+            LOGGER.info("auto compact skipped: setting disabled")
+        elif self._compacting:
+            LOGGER.info("auto compact skipped: already compacting")
+        elif outcome is None:
+            LOGGER.info("auto compact skipped: no outcome")
+        elif outcome.executor != TARGET_OPENCHAMBER:
+            LOGGER.info("auto compact skipped: executor=%s", outcome.executor)
+        else:
+            LOGGER.info(
+                "auto compact skipped: missing session/directory "
+                "session=%r directory=%r",
+                getattr(outcome, "session_id", None),
+                getattr(outcome, "directory", None),
+            )
         self._finish_task("完成：等待下一个任务")
+        if rotation_trigger is not None:
+            self._start_auto_rotation(rotation_trigger)
+
+    def _start_auto_compact(self, outcome, rotation_trigger=None):
+        """Trigger a first-class opencode compaction of the OpenChamber
+        session that produced the reply just copied, and keep the task lane
+        open until that compaction finishes.  Runs on a worker so the Qt main
+        thread does not block while the compaction completes."""
+        self._compacting = True
+        self._set_status("回复已复制；正在压缩当前会话上下文…")
+        task = CompactTask(self._workflow, outcome.session_id, outcome.directory)
+        task.signals.done.connect(
+            lambda ok: self._on_auto_compact_done(ok, rotation_trigger)
+        )
+        self._track_general_worker(task)
+
+    @Slot()
+    def _on_auto_compact_done(self, ok: bool, rotation_trigger):
+        self._compacting = False
+        LOGGER.info("auto compact finished ok=%s", ok)
+        if ok:
+            self._finish_task("完成：等待下一个任务")
+            self.detail_label.setText("回复已复制；当前会话上下文压缩完成。")
+        else:
+            LOGGER.warning("auto compact failed after a successful reply")
+            self._finish_task("回复完成，但上下文压缩失败")
+            self.detail_label.setText(
+                "回复已完成并复制，但上下文压缩失败；不影响已完成的回复。"
+            )
         if rotation_trigger is not None:
             self._start_auto_rotation(rotation_trigger)
 
@@ -2581,17 +2662,9 @@ class RelayWindow(QMainWindow):
         outcome = self._workflow.outcome
         if outcome is not None and outcome.session_id:
             previous_session_id = outcome.session_id
-        # Rotation base-name hint: the current fixed session's title (the
-        # combo label is "标题（ses_xxx）"; a bare id has no title to reuse).
-        # The rotation core strips any old " - 第N个" suffix from it; a
-        # persisted base title always wins over this hint.
+        # ponytail: the fixed-session UI row is gone; a persisted base title
+        # in settings always wins over any UI hint, so no hint is passed.
         base_title_hint = None
-        session_id = self._current_session_id()
-        label = self._session_combo.currentText().strip()
-        if label and label != "— 未配置会话 —" and session_id:
-            suffix = f"（{session_id}）"
-            if label.endswith(suffix) and len(label) > len(suffix):
-                base_title_hint = label[: -len(suffix)]
         task = RotateSessionTask(
             url,
             directory,
@@ -2610,7 +2683,6 @@ class RelayWindow(QMainWindow):
         self._rotation_pending = False
         directory = self._rotation_directory
         self._rotation.reset(directory)
-        self._adopt_openchamber_session(session_id)
         self._set_status("自动轮换：已切换到新会话")
         self.detail_label.setText(
             f"自动轮换：达到阈值后已创建并切换到新会话 {session_id}。"
@@ -2719,19 +2791,6 @@ class RelayWindow(QMainWindow):
                 self._set_status(
                     f"{status}；等待任务 {len(queued)} 个，将按顺序继续执行。"
                 )
-
-    def _adopt_openchamber_session(self, session_id: str):
-        """Select the newly-created session in the session selector and
-        refresh the server-side session list after a fresh-session retry."""
-        self._session_combo.blockSignals(True)
-        if self._session_combo.findData(session_id) < 0:
-            self._session_combo.addItem(session_id, session_id)
-        self._session_combo.setCurrentIndex(
-            self._session_combo.findData(session_id)
-        )
-        self._session_combo.blockSignals(False)
-        self._set_status("已切换到新会话")
-        self._refresh_sessions()
 
     # ------------------------------------------------------------------ #
     # self check (informational only: must never block monitoring)
@@ -3006,7 +3065,10 @@ class RelayWindow(QMainWindow):
             self._show_error("当前没有可打开的 OpenChamber 会话")
             return
         try:
-            OpenChamberClient(self._settings.openchamber_url).open_session(
+            OpenChamberClient(
+                self._settings.openchamber_url,
+                auth_token=self._settings.openchamber_auth_token or None,
+            ).open_session(
                 outcome.session_id
             )
         except Exception as exc:
@@ -3216,14 +3278,13 @@ class RelayWindow(QMainWindow):
         and be a folder (not a file)."""
         return bool(directory) and os.path.isdir(directory)
 
-    def _clear_session_selection(self):
+    def _clear_session_selection(self, directory: str):
         """Discard any previously chosen fixed session.  Called when the
         project directory changes so a session saved for another project is
         not reused across projects."""
-        self._session_combo.blockSignals(True)
-        self._session_combo.setCurrentIndex(0)  # "未配置会话"
-        self._session_combo.clearEditText()
-        self._session_combo.blockSignals(False)
+        self._settings.openchamber_session_id = ""
+        key = directory_key(directory)
+        self._settings.openchamber_sessions.pop(key, None)
 
     @Slot()
     def _browse_directory(self):
@@ -3244,64 +3305,11 @@ class RelayWindow(QMainWindow):
         if os.path.normcase(os.path.abspath(old)) != os.path.normcase(
             os.path.abspath(directory)
         ):
-            self._clear_session_selection()
+            self._clear_session_selection(directory)
             self._rotation.reset(directory)
         if not self._save_settings():
             return
-        self._refresh_sessions()
         self._refresh_meta()
-
-    @Slot()
-    def _refresh_sessions(self):
-        raw = self._directory_edit.text().strip()
-        if not raw:
-            self._show_error("请先填写项目目录，再刷新会话列表")
-            return
-        if not self._directory_is_valid(raw):
-            self._show_error(f"项目目录不存在或不是文件夹，无法刷新会话：{raw}")
-            return
-        # 规范化项目路径并先保存，使后续刷新/发送使用标准目录形式。
-        directory = normalize_directory(raw)
-        self._directory_edit.setText(directory)
-        self._save_settings()
-        self._pending_session_id = self._current_session_id()
-        url = self._url_edit.text().strip() or DEFAULT_OPENCHAMBER_URL
-        self._set_controls_enabled(False)
-        task = SessionListTask(url, directory)
-        task.signals.sessions.connect(self._sessions_loaded)
-        task.signals.failed.connect(self._sessions_failed)
-        self._track_general_worker(task)
-
-    @Slot(object)
-    def _sessions_loaded(self, sessions: list):
-        self._session_combo.blockSignals(True)
-        self._session_combo.clear()
-        self._session_combo.addItem("— 未配置会话 —", None)
-        for session_id, title in sessions:
-            label = f"{title}（{session_id}）" if title else session_id
-            self._session_combo.addItem(label, session_id)
-        index = self._session_combo.findData(self._pending_session_id)
-        if index >= 0:
-            self._session_combo.setCurrentIndex(index)
-        elif self._pending_session_id:
-            self._session_combo.setCurrentText(self._pending_session_id)
-        else:
-            self._session_combo.setCurrentIndex(0)
-        self._session_combo.blockSignals(False)
-        self._set_controls_enabled(not self._busy)
-        if sessions:
-            self.detail_label.setText(
-                f"找到 {len(sessions)} 个会话；请选择所需会话后保存设置。"
-            )
-            self._set_status("会话列表已刷新")
-        else:
-            self.detail_label.setText("该项目暂无会话，可点击“新建会话”创建")
-            self._set_status("该项目暂无会话")
-
-    @Slot(str)
-    def _sessions_failed(self, error: str):
-        self._set_controls_enabled(not self._busy)
-        self._show_error(f"刷新会话列表失败：{translate_error(error)}")
 
     @Slot()
     def _refresh_meta(self):
@@ -3318,7 +3326,11 @@ class RelayWindow(QMainWindow):
         url = self._url_edit.text().strip() or DEFAULT_OPENCHAMBER_URL
         self._set_controls_enabled(False)
         self._set_status("正在刷新 Agent/Model")
-        task = RefreshMetaTask(url, directory)
+        task = RefreshMetaTask(
+            url,
+            directory,
+            auth_token=self._settings.openchamber_auth_token or None,
+        )
         task.signals.sessions.connect(self._meta_loaded)
         task.signals.failed.connect(self._meta_failed)
         self._track_general_worker(task)
@@ -3356,76 +3368,6 @@ class RelayWindow(QMainWindow):
         self._show_error(f"刷新 Agent/Model 失败：{translate_error(error)}")
 
     @Slot()
-    def _create_session(self):
-        directory = self._directory_edit.text().strip()
-        if not directory:
-            self._show_error("请先填写项目目录，再新建会话")
-            return
-        if not self._directory_is_valid(directory):
-            self._show_error(
-                f"项目目录不存在或不是文件夹，无法新建会话：{directory}"
-            )
-            return
-        url = self._url_edit.text().strip() or DEFAULT_OPENCHAMBER_URL
-        title = f"AI Relay 新建会话（{datetime.now():%Y-%m-%d %H:%M:%S}）"
-        self._set_controls_enabled(False)
-        self._set_status("正在新建会话")
-        task = CreateSessionTask(url, title, directory)
-        task.signals.succeeded.connect(self._session_created)
-        task.signals.failed.connect(self._session_create_failed)
-        self._track_general_worker(task)
-
-    @Slot(str)
-    def _session_created(self, session_id: str):
-        # a manually created session re-zeroes the current project counter
-        directory = self._directory_edit.text().strip()
-        if directory:
-            self._rotation.reset(directory)
-        self._session_combo.blockSignals(True)
-        if self._session_combo.findData(session_id) < 0:
-            self._session_combo.addItem(session_id, session_id)
-        self._session_combo.setCurrentIndex(
-            self._session_combo.findData(session_id)
-        )
-        self._session_combo.blockSignals(False)
-        if not self._save_settings():
-            self._set_controls_enabled(not self._busy)
-            return
-        self._set_controls_enabled(not self._busy)
-        self.detail_label.setText(
-            f"已创建新会话 {session_id} 并保存设置；后续任务将发送到该会话。"
-        )
-        self._set_status("新会话已创建并设为固定会话")
-
-    @Slot(str)
-    def _session_create_failed(self, error: str):
-        self._set_controls_enabled(not self._busy)
-        self._show_error(f"新建会话失败：{translate_error(error)}")
-
-    @Slot(bool)
-    def _on_auto_rotate_toggled(self, enabled: bool):
-        # The threshold spin is editable only while rotation is on; the
-        # checkbox is the live runtime switch (mirrored into settings at
-        # once, so counting follows it immediately) and either direction of
-        # the toggle re-zeroes every project counter.
-        self._auto_rotate_threshold_spin.setEnabled(enabled)
-        self._auto_rotate_inherit_check.setEnabled(enabled)
-        self._settings.auto_rotate_enabled = enabled
-        self._rotation.reset_all()
-
-    @Slot(int)
-    def _on_session_manual_switch(self, _index: int):
-        # A user-initiated session switch (popup pick or Enter on the line
-        # edit) resets the current project's rotation counter.
-        directory = self._settings.openchamber_directory.strip()
-        if directory:
-            self._rotation.reset(directory)
-        # The monitor anchors a FIXED session; switching the session while
-        # monitoring would silently mismatch it, so stop the monitor instead.
-        if self._oc_monitor_active:
-            self._stop_monitor()
-
-    @Slot()
     def _save_settings(self):
         model = self._model_combo.currentText().strip()
         known_models = {
@@ -3451,20 +3393,9 @@ class RelayWindow(QMainWindow):
             self._settings.openchamber_directory = self._directory_edit.text().strip()
             self._settings.openchamber_agent = self._agent_combo.currentText().strip()
             self._settings.openchamber_model = model
-            self._settings.auto_rotate_enabled = self._auto_rotate_check.isChecked()
-            self._settings.auto_rotate_threshold = self._auto_rotate_threshold_spin.value()
-            self._settings.auto_rotate_inherit_auto_accept = (
-                self._auto_rotate_inherit_check.isChecked()
+            self._settings.auto_compact_after_response = (
+                self._auto_compact_check.isChecked()
             )
-            session_id = self._current_session_id()
-            self._settings.openchamber_session_id = session_id
-            directory = self._settings.openchamber_directory
-            if directory:
-                key = directory_key(directory)
-                if session_id:
-                    self._settings.openchamber_sessions[key] = session_id
-                else:
-                    self._settings.openchamber_sessions.pop(key, None)
             self._settings.validate()
             self._settings.save()
         except Exception as exc:
@@ -3478,25 +3409,6 @@ class RelayWindow(QMainWindow):
     # helpers
     # ------------------------------------------------------------------ #
 
-    def _current_session_id(self) -> str:
-        """The real session id currently held by the combo, extracted with the
-        same rule used when saving: a selected candidate's data is
-        authoritative; an edited/id-typed line that differs from the selected
-        item's label is kept verbatim.  The display label '标题（ses_xxx）' is
-        never treated as an id."""
-        session_id = self._session_combo.currentData()
-        session_text = self._session_combo.currentText().strip()
-        index = self._session_combo.currentIndex()
-        if (
-            isinstance(session_id, str)
-            and bool(session_id)
-            and session_text == self._session_combo.itemText(index)
-        ):
-            return session_id
-        if session_text == "— 未配置会话 —":
-            return ""
-        return session_text
-
     def _set_controls_enabled(self, enabled: bool):
         self.start_button.setEnabled(enabled and not self._listener.enabled)
         self.pause_button.setEnabled(enabled and self._listener.enabled)
@@ -3504,15 +3416,7 @@ class RelayWindow(QMainWindow):
         self._save_settings_button.setEnabled(enabled)
         self._browse_directory_button.setEnabled(enabled)
         self._refresh_meta_button.setEnabled(enabled)
-        self._refresh_sessions_button.setEnabled(enabled)
-        self._create_session_button.setEnabled(enabled)
-        self._auto_rotate_check.setEnabled(enabled)
-        self._auto_rotate_threshold_spin.setEnabled(
-            enabled and self._auto_rotate_check.isChecked()
-        )
-        self._auto_rotate_inherit_check.setEnabled(
-            enabled and self._auto_rotate_check.isChecked()
-        )
+        self._auto_compact_check.setEnabled(enabled)
         # "停止当前任务" stays clickable WHILE a task runs (never grayed out
         # by busy); it only stops the wait, never the OpenChamber session.
         # It is ALSO offered while an interrupted auto-relay task awaits a

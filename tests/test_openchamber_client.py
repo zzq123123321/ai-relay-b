@@ -27,6 +27,7 @@ from tests.fakes import (
 
 MESSAGE_PATH = "/api/session/ses_1/message?directory=D%3A%2Fp"
 STATUS_PATH = "/api/session/status?directory=D%3A%2Fp"
+SUMMARIZE_PATH = "/api/session/ses_1/summarize?directory=D%3A%2Fp"
 
 
 def test_verify_ok():
@@ -58,6 +59,93 @@ def test_auth_error_401_tells_operator_to_configure_auth():
     client = make_client(http)
     with pytest.raises(OpenChamberAuthError, match="authentication"):
         client.verify()
+
+
+def test_auth_token_is_attached_as_bearer_header():
+    http = FakeHttp()
+    http.route("GET", "/health", FakeResponse(200, {"status": "ok"}))
+    client = make_client(
+        http, base_url="http://127.0.0.1:57123", auth_token="secret-token"
+    )
+    assert client.verify()["status"] == "ok"
+    assert http.headers.get("Authorization") == "Bearer secret-token"
+
+
+def test_auth_token_empty_leaves_no_auth_header():
+    http = FakeHttp()
+    http.route("GET", "/health", FakeResponse(200, {"status": "ok"}))
+    client = make_client(http)
+    client.verify()
+    assert "Authorization" not in http.headers
+
+
+def test_compact_uses_openchamber_summarize_contract():
+    http = FakeHttp()
+    http.route("POST", SUMMARIZE_PATH, FakeResponse(200, True))
+    client = make_client(http)
+
+    client.compact("ses_1", "D:/p", ModelRef("opencode", "big-pickle"))
+
+    assert http.calls == [
+        (
+            "POST",
+            SUMMARIZE_PATH,
+            {"providerID": "opencode", "modelID": "big-pickle"},
+        )
+    ]
+
+
+def test_compact_requires_configured_model():
+    client = make_client(FakeHttp())
+
+    with pytest.raises(OpenChamberSessionError, match="provider/model"):
+        client.compact("ses_1", "D:/p")
+
+
+def test_auth_token_loopback_hosts_attach_bearer():
+    for host in ("127.0.0.1", "127.8.9.10", "localhost", "[::1]"):
+        http = FakeHttp()
+        http.route("GET", "/health", FakeResponse(200, {"status": "ok"}))
+        client = make_client(
+            http, base_url=f"http://{host}:57123", auth_token="secret-token"
+        )
+        client.verify()
+        assert http.headers.get("Authorization") == "Bearer secret-token"
+
+
+def test_auth_token_non_loopback_host_is_ignored(caplog):
+    http = FakeHttp()
+    http.route("GET", "/health", FakeResponse(200, {"status": "ok"}))
+    client = make_client(
+        http, base_url="http://192.168.31.116:57123", auth_token="secret-token"
+    )
+    client.verify()
+    assert "Authorization" not in http.headers
+    assert any(
+        "not a loopback address" in record.message
+        and "secret-token" not in record.message
+        for record in caplog.records
+    )
+
+
+def test_401_reloads_rotated_local_token_and_retries_once(monkeypatch):
+    http = FakeHttp()
+    responses = iter(
+        [FakeResponse(401, {"error": "unauthorized"}), FakeResponse(200, [])]
+    )
+    http.route("GET", "/api/session", lambda: next(responses))
+    client = make_client(
+        http, base_url="http://127.0.0.1:57123", auth_token="stale-token"
+    )
+
+    def refresh():
+        http.headers["Authorization"] = "Bearer rotated-token"
+        return True
+
+    monkeypatch.setattr(client, "_reload_local_auth_token", refresh)
+    assert client.list_sessions() == []
+    assert http.headers["Authorization"] == "Bearer rotated-token"
+    assert [call[0] for call in http.calls[-2:]] == ["GET", "GET"]
 
 
 SEND_PATH = "/api/openchamber/sessions/ses_1/send"

@@ -538,7 +538,9 @@ def build_monitor_window(
         poll_interval=poll_interval,
         completion_timeout=5.0,
     )
-    monkeypatch.setattr(ui_mod, "OpenChamberClient", lambda url: fake)
+    monkeypatch.setattr(
+        ui_mod, "OpenChamberClient", lambda url, **kwargs: fake
+    )
     window = build_window(qapp, monkeypatch, tmp_path, settings=settings)
     window._startup_check_pending = False
     return window, fake
@@ -604,6 +606,71 @@ def test_ui_monitor_wraps_new_reply_once(qapp, monkeypatch, tmp_path):
 
         # the reply was persisted for re-copy
         assert window._workflow.load_reply(message.in_reply_to) == text
+    finally:
+        drain_monitor(window)
+
+
+def test_ui_monitor_auto_compacts_after_wrapping_new_reply(
+    qapp, monkeypatch, tmp_path,
+):
+    """The monitor path mirrors the A-side compact lane: after a monitored
+    reply is wrapped and copied, a first-class opencode compaction is
+    requested on the same OpenChamber session (only when
+    auto_compact_after_response is on and the reply came from a real session)."""
+    import ui as ui_mod
+    from PySide6.QtTest import QTest
+    from tests.test_fifo_queue import ControllableRoundOc
+    from tests.test_ui_startup import build_window
+
+    qapp.clipboard().clear()
+    monitor_fake = MutableMessages()
+    oc = ControllableRoundOc("ses_test123", str(tmp_path), ["reply one"])
+    oc.compact_gate = threading.Event()
+    settings = RelaySettings(
+        default_target=TARGET_OPENCHAMBER,
+        openchamber_directory=str(tmp_path),
+        openchamber_session_id="ses_test123",
+        poll_interval=0.05,
+        completion_timeout=5.0,
+        auto_compact_after_response=True,
+    )
+    monkeypatch.setattr(
+        ui_mod, "OpenChamberClient", lambda url, **kwargs: monitor_fake
+    )
+    window = build_window(
+        qapp, monkeypatch, tmp_path, settings=settings, openchamber=oc
+    )
+    window._startup_check_pending = False
+    try:
+        assert wait_until(lambda: window._listener.enabled), (
+            "listener never started"
+        )
+        assert wait_until(lambda: not window._busy), (
+            "startup tasks never settled"
+        )
+        window._toggle_monitor()
+        assert wait_until(
+            lambda: "正在监听 OpenChamber" in window.status_label.text()
+        ), "monitor never started listening"
+
+        monitor_fake.add(completed_reply("a_mc_auto", created=3000, text="reply"))
+        assert wait_until(
+            lambda: "reply" in qapp.clipboard().text(),
+            timeout=5.0,
+        ), "monitor reply was never wrapped"
+        assert wait_until(lambda: oc.compact_calls), (
+            "monitor reply never triggered the compact lane"
+        )
+        assert window._compacting, (
+            "monitor reply never triggered the compact lane"
+        )
+        assert not oc.sent_prompts, (
+            "compaction must be a direct API call, not a text prompt"
+        )
+        oc.compact_gate.set()  # the compaction finishes
+        assert wait_until(lambda: not window._compacting), (
+            "monitor compact lane never released"
+        )
     finally:
         drain_monitor(window)
 
@@ -973,26 +1040,6 @@ def test_ui_monitor_stale_interruption_after_stop_is_ignored(
         assert window._oc_monitor_interrupted is False
         assert window.continue_button.isEnabled() is False
         assert window.stop_button.isEnabled() is False
-    finally:
-        drain_monitor(window)
-
-
-def test_ui_session_manual_switch_stops_monitor(qapp, monkeypatch, tmp_path):
-    from PySide6.QtTest import QTest
-
-    window, fake = build_tiny_delay_monitor(qapp, monkeypatch, tmp_path)
-    try:
-        window._toggle_monitor()
-        assert window._oc_monitor_active
-        window._on_session_manual_switch(0)
-        assert wait_until(
-            lambda: not window._monitor_workers and not window._oc_monitor_stopping
-        ), "session switch did not drain the monitor"
-        assert not window._oc_monitor_active
-        assert window.monitor_button.text() == "监控 OpenChamber"
-        fake.add(completed_reply("a_new", created=3000, text="ignored"))
-        QTest.qWait(300)
-        assert manual_completed_ids(window) == set()
     finally:
         drain_monitor(window)
 
@@ -1800,8 +1847,8 @@ def test_window_close_during_auto_continue_drains_and_closes(
 def test_monitor_fast_start_stop_switch_session_restart(
     qapp, monkeypatch, tmp_path,
 ):
-    """Requirement: a fast start -> stop -> manual session switch -> restart
-    cycle never overlaps two monitor generations and every stop drains fully."""
+    """Requirement: a fast start -> stop -> start cycle never overlaps two
+    monitor generations and every stop drains fully."""
     qapp.clipboard().clear()
     window, fake = build_tiny_delay_monitor(qapp, monkeypatch, tmp_path)
     try:
@@ -1811,10 +1858,6 @@ def test_monitor_fast_start_stop_switch_session_restart(
         assert wait_until(
             lambda: not window._monitor_workers and not window._oc_monitor_stopping
         ), "first stop did not drain"
-        window._on_session_manual_switch(0)
-        assert wait_until(
-            lambda: not window._monitor_workers and not window._oc_monitor_stopping
-        ), "session switch did not drain"
         window._toggle_monitor()
         assert window._oc_monitor_active
         fake.add(completed_reply("a_cycle", created=3000, text="cycle done"))
@@ -2212,7 +2255,7 @@ def test_ui_b_side_task_status_missing_auto_continue_completes_task(
     fake.status = "missing_from_status_map"
     import ui as ui_mod
 
-    monkeypatch.setattr(ui_mod, "OpenChamberClient", lambda url: fake)
+    monkeypatch.setattr(ui_mod, "OpenChamberClient", lambda url, **kwargs: fake)
     settings = RelaySettings(
         default_target=TARGET_OPENCHAMBER,
         openchamber_directory=str(tmp_path),

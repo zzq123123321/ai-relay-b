@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
 
 import requests
 
@@ -37,30 +38,35 @@ class FakeHttp:
         self.calls: list[tuple[str, str, dict | None]] = []
         self.handlers: dict[tuple[str, str], Any] = {}
         self.raise_next: Exception | None = None
+        self.headers: dict[str, str] = {}
 
     def route(self, method: str, path: str, response: FakeResponse) -> None:
         self.handlers[(method.upper(), path)] = response
+
+    def _normalize(self, url: str) -> str:
+        parts = urlsplit(url)
+        return parts.path + (f"?{parts.query}" if parts.query else "")
 
     def _dispatch(self, method: str, url: str, body: dict | None) -> FakeResponse:
         if self.raise_next is not None:
             exc, self.raise_next = self.raise_next, None
             raise exc
-        path = url.split("http://fake.local", 1)[-1]
+        path = self._normalize(url)
         handler = self.handlers.get((method.upper(), path))
         if handler is None:
             return FakeResponse(404, {"error": f"no route for {method} {path}"})
         return handler if isinstance(handler, FakeResponse) else handler()
 
     def get(self, url: str, timeout: float = 0, **_kw: Any) -> FakeResponse:
-        self.calls.append(("GET", url.split("http://fake.local", 1)[-1], None))
+        self.calls.append(("GET", self._normalize(url), None))
         return self._dispatch("GET", url, None)
 
     def post(self, url: str, json: dict | None = None, timeout: float = 0, **_kw: Any) -> FakeResponse:
-        self.calls.append(("POST", url.split("http://fake.local", 1)[-1], json))
+        self.calls.append(("POST", self._normalize(url), json))
         return self._dispatch("POST", url, json)
 
     def put(self, url: str, json: dict | None = None, timeout: float = 0, **_kw: Any) -> FakeResponse:
-        self.calls.append(("PUT", url.split("http://fake.local", 1)[-1], json))
+        self.calls.append(("PUT", self._normalize(url), json))
         return self._dispatch("PUT", url, json)
 
     def close(self) -> None:
@@ -68,11 +74,13 @@ class FakeHttp:
 
 
 def make_client(
-    http: FakeHttp, base_url: str = "http://fake.local"
+    http: FakeHttp, base_url: str = "http://fake.local", auth_token: str | None = None
 ):
     from core.openchamber import OpenChamberClient
 
-    return OpenChamberClient(base_url=base_url, timeout=1.0, transport=http)
+    return OpenChamberClient(
+        base_url=base_url, timeout=1.0, transport=http, auth_token=auth_token
+    )
 
 
 def make_dispatch(

@@ -23,6 +23,11 @@ class RelaySettingsError(RuntimeError):
 class RelaySettings:
     default_target: str = TARGET_REASONIX
     openchamber_url: str = DEFAULT_OPENCHAMBER_URL
+    # Optional OpenChamber bearer token attached to every API request.
+    # Empty means the client stays unauthenticated (the pre-1.23 default).
+    # Tokens are operator-supplied secrets; never log them, never write them
+    # into the task registry or any report.
+    openchamber_auth_token: str = ""
     openchamber_directory: str = ""
     openchamber_session_id: str = ""
     openchamber_sessions: dict[str, str] = field(default_factory=dict)
@@ -33,6 +38,11 @@ class RelaySettings:
     auto_rotate_enabled: bool = False
     auto_rotate_threshold: int = 5
     auto_rotate_inherit_auto_accept: bool = False
+    # Send a bare `/compact` control command to the OpenChamber session that
+    # just produced a reply, and wait for the compaction to finish before the
+    # next queued task starts.  The reply itself is never affected by a
+    # compact failure.  Disable while debugging/measuring.
+    auto_compact_after_response: bool = True
     # Per normalized project directory: the last committed auto-rotation
     # sequence (the directory has already been rotated up to "第N个"; the
     # next rotation creates "第N+1个").  Persisted so the sequence survives

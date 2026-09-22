@@ -62,13 +62,17 @@ open the session; it does not prove the window displayed it.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import threading
 import time
 from dataclasses import dataclass, field
+from ipaddress import ip_address
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 import requests
 
@@ -400,6 +404,88 @@ def extract_agent_model_sets(
     return agents, models
 
 
+def _find_openchamber_window():
+    """The OpenChamber desktop window via UIA, or None.
+
+    The foreground window is preferred when it is OpenChamber; otherwise the
+    first top-level window whose title mentions OpenChamber.  UIA is only
+    needed on Windows; any failure (missing uiautomation, COM error) yields
+    None so callers fall back to the non-UIA session selection.
+    """
+    try:
+        import uiautomation
+    except ImportError:
+        return None
+    try:
+        import ctypes
+
+        foreground = ctypes.windll.user32.GetForegroundWindow()
+    except Exception:
+        foreground = 0
+    initializer = uiautomation.UIAutomationInitializerInThread()
+    try:
+        windows = []
+        try:
+            for window in uiautomation.GetRootControl().GetChildren():
+                try:
+                    name = window.Name or ""
+                except Exception:
+                    continue
+                if "OpenChamber" in name:
+                    windows.append(window)
+        except Exception:
+            pass
+        if not windows:
+            return None
+        if foreground:
+            for window in windows:
+                try:
+                    if window.hwnd == foreground:
+                        return window
+                except Exception:
+                    continue
+        return windows[0]
+    finally:
+        initializer.Uninitialize()
+
+
+def _walk_window_header_texts(
+    window,
+    texts: list,
+    band_top: int | None,
+    band_bottom: int | None,
+    depth: int = 0,
+    total: list | None = None,
+) -> None:
+    """Collect TextControl names from the window header band (top ~72px).
+
+    Chromium reports stale rectangles for virtualized chat rows, so the band
+    alone is not exact; the caller disambiguates by matching against known
+    session titles.
+    """
+    if total is None:
+        total = [0]
+    if total[0] > 6000 or depth > 40:
+        return
+    for child in window.GetChildren():
+        total[0] += 1
+        try:
+            if child.ControlTypeName != "TextControl":
+                name = ""
+            else:
+                name = (child.Name or "").strip()
+            if name and len(name) < 100:
+                if band_top is None:
+                    texts.append((-1, name))
+                else:
+                    rect = child.BoundingRectangle
+                    if band_top <= rect.top <= band_bottom:
+                        texts.append((rect.top, name))
+        except Exception:
+            pass
+        _walk_window_header_texts(child, texts, band_top, band_bottom, depth + 1, total)
+
+
 class OpenChamberClient:
     """Minimal OpenChamber desktop API client used by the relay."""
 
@@ -408,12 +494,78 @@ class OpenChamberClient:
         base_url: str = "http://127.0.0.1:57123",
         timeout: float = 10.0,
         transport: requests.Session | None = None,
+        auth_token: str | None = None,
     ):
         if not base_url or not base_url.strip():
             raise OpenChamberSessionError("OpenChamber address must not be empty")
         self.base_url = base_url.strip().rstrip("/")
         self.timeout = timeout
         self._http = transport if transport is not None else requests.Session()
+        self._attach_auth(auth_token)
+
+    def _attach_auth(self, auth_token: str | None) -> None:
+        """Attach the OpenChamber auth token ONLY for loopback destinations.
+
+        The token is an operator secret: it must never be echoed into logs.
+        Only 127.0.0.0/8, ``localhost`` and ``::1`` may carry it; a token
+        configured for any other host is silently ignored (with a warning
+        that names the host, not the token)."""
+        if not auth_token:
+            return
+        hostname = urlsplit(self.base_url).hostname
+        if hostname is None:
+            hostname = ""
+        try:
+            is_loopback_ip = ip_address(hostname).is_loopback
+        except ValueError:
+            is_loopback_ip = False
+        if hostname.lower() == "localhost" or is_loopback_ip:
+            self._http.headers["Authorization"] = f"Bearer {auth_token}"
+        else:
+            _LOG.warning(
+                "OpenChamber auth token ignored: destination %r is not a "
+                "loopback address; refusing to attach the token",
+                hostname,
+            )
+
+    def _is_loopback_destination(self) -> bool:
+        hostname = urlsplit(self.base_url).hostname or ""
+        if hostname.lower() == "localhost":
+            return True
+        try:
+            return ip_address(hostname).is_loopback
+        except ValueError:
+            return False
+
+    def _reload_local_auth_token(self) -> bool:
+        """Reload OpenChamber's rotated desktop token for loopback only."""
+        if not self._is_loopback_destination():
+            return False
+        data_dir = os.environ.get("OPENCHAMBER_DATA_DIR", "").strip()
+        settings_path = (
+            Path(data_dir) / "settings.json"
+            if data_dir
+            else Path.home() / ".config" / "openchamber" / "settings.json"
+        )
+        try:
+            payload = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return False
+        token = payload.get("desktopLocalClientToken") if isinstance(payload, dict) else None
+        if not isinstance(token, str) or not token.strip():
+            return False
+        authorization = f"Bearer {token.strip()}"
+        if self._http.headers.get("Authorization") == authorization:
+            return False
+        self._http.headers["Authorization"] = authorization
+        return True
+
+    def _request_with_auth_refresh(self, method: str, path: str, **kwargs: Any):
+        request = getattr(self._http, method)
+        response = request(f"{self.base_url}{path}", **kwargs)
+        if response.status_code in (401, 403) and self._reload_local_auth_token():
+            response = request(f"{self.base_url}{path}", **kwargs)
+        return response
 
     # ------------------------------------------------------------------ #
     # connection
@@ -421,8 +573,8 @@ class OpenChamberClient:
 
     def health(self) -> dict[str, Any]:
         try:
-            response = self._http.get(
-                f"{self.base_url}/health", timeout=self.timeout
+            response = self._request_with_auth_refresh(
+                "get", "/health", timeout=self.timeout
             )
         except requests.RequestException as exc:
             raise OpenChamberUnavailableError(
@@ -518,6 +670,49 @@ class OpenChamberClient:
                 continue
             sessions.append((session_id, title if isinstance(title, str) else ""))
         return sessions
+
+    def find_active_session_id(self, directory: str) -> str:
+        """ID of the session the OpenChamber desktop window is showing.
+
+        OpenChamber has no API for the UI's active session, but the desktop
+        window header renders the displayed session title as plain text at
+        the top of the window.  Read that text through Windows UI Automation
+        (same stack as the Reasonix automation) and match it against the
+        directory's session list.  Returns "" when no reliable match exists;
+        the caller then falls back to the configured/created session.
+        """
+        sessions = self.list_sessions(directory)
+        # ponytail: duplicate titles are ambiguous in the header; the list is
+        # newest-first, so the first id wins.
+        by_title: dict[str, list[str]] = {}
+        for session_id, title in sessions:
+            title = title.strip()
+            if title:
+                by_title.setdefault(title, []).append(session_id)
+        if not by_title:
+            return ""
+        window = _find_openchamber_window()
+        if window is None:
+            return ""
+        try:
+            rect = window.BoundingRectangle
+            band_top, band_bottom = rect.top - 4, rect.top + 72
+        except Exception:
+            band_top, band_bottom = None, None
+        header_texts: list[tuple[int, str]] = []
+        _walk_window_header_texts(window, header_texts, band_top, band_bottom)
+        candidates: list[tuple[int, str]] = []
+        for text_top, text in header_texts:
+            ids = by_title.get(text)
+            if ids:
+                candidates.append((text_top, ids[0]))
+        if not candidates:
+            return ""
+        if len(candidates) > 1:
+            # The header title sits at the very top of the window; palette
+            # results or sidebar rows listing other titles sit lower down.
+            candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
 
     def list_sessions_with_projects(
         self, directory: str | None = None
@@ -725,6 +920,32 @@ class OpenChamberClient:
             prompt_text=prompt,
         )
 
+    def compact(
+        self, session_id: str, directory: str, model: ModelRef | None = None
+    ) -> None:
+        """Compact a session through the same legacy API used by OpenChamber.
+
+        OpenChamber's local ``/compact`` composer action calls
+        ``session.summarize``.  Sending ``/compact`` through the normal prompt
+        route treats it as ordinary text, while the newer v2 compact endpoint
+        is not compatible with the bundled OpenCode server used here.
+        """
+        if model is None:
+            raise OpenChamberSessionError(
+                "OpenChamber compaction requires a configured provider/model"
+            )
+        encoded_directory = requests.utils.quote(directory, safe="")
+        payload = self._post_json(
+            f"/api/session/{session_id}/summarize?directory={encoded_directory}",
+            model.as_payload(),
+            timeout=max(self.timeout, 120.0),
+        )
+        if payload is not True:
+            raise OpenChamberSessionError(
+                "OpenChamber summarize did not confirm compaction for "
+                f"session {session_id}"
+            )
+
     # ------------------------------------------------------------------ #
     # status and messages
     # ------------------------------------------------------------------ #
@@ -834,7 +1055,9 @@ class OpenChamberClient:
 
     def _get_json(self, path: str) -> Any:
         try:
-            response = self._http.get(f"{self.base_url}{path}", timeout=self.timeout)
+            response = self._request_with_auth_refresh(
+                "get", path, timeout=self.timeout
+            )
         except requests.RequestException as exc:
             raise OpenChamberUnavailableError(
                 f"cannot reach OpenChamber at {self.base_url}: {exc}"
@@ -847,10 +1070,20 @@ class OpenChamberClient:
                 f"OpenChamber {path} returned a non-JSON body"
             ) from exc
 
-    def _post_json(self, path: str, body: Mapping[str, Any]) -> Any:
+    def _post_json(
+        self,
+        path: str,
+        body: Mapping[str, Any],
+        headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
         try:
-            response = self._http.post(
-                f"{self.base_url}{path}", json=dict(body), timeout=self.timeout
+            response = self._request_with_auth_refresh(
+                "post",
+                path,
+                json=dict(body),
+                headers=dict(headers) if headers else None,
+                timeout=self.timeout if timeout is None else timeout,
             )
         except requests.RequestException as exc:
             raise OpenChamberUnavailableError(
@@ -867,8 +1100,8 @@ class OpenChamberClient:
 
     def _put_json(self, path: str, body: Mapping[str, Any]) -> Any:
         try:
-            response = self._http.put(
-                f"{self.base_url}{path}", json=dict(body), timeout=self.timeout
+            response = self._request_with_auth_refresh(
+                "put", path, json=dict(body), timeout=self.timeout
             )
         except requests.RequestException as exc:
             raise OpenChamberUnavailableError(

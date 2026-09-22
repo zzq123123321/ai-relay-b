@@ -50,7 +50,12 @@ def build_window(
     from core.relay import RelayWorkflow as BaseRelayWorkflow
 
     def effective_settings():
-        return settings or RelaySettings(openchamber_directory="D:/proj")
+        return settings or RelaySettings(
+            openchamber_directory="D:/proj",
+            # post-reply compaction is a separate feature: existing UI tests
+            # keep exercising their individual flows without an extra /compact
+            auto_compact_after_response=False,
+        )
 
     class TestWorkflow(BaseRelayWorkflow):
         def __init__(self, reasonix, settings=None):
@@ -170,6 +175,31 @@ def test_window_starts_even_when_reasonix_self_check_fails(qapp, monkeypatch, tm
     finally:
         shutdown_window(window)
 
+
+def test_openchamber_default_skips_reasonix_startup_self_check(
+    qapp, monkeypatch, tmp_path
+):
+    from core.relay_settings import TARGET_OPENCHAMBER
+
+    settings = RelaySettings(
+        default_target=TARGET_OPENCHAMBER,
+        openchamber_directory="D:/proj",
+        auto_compact_after_response=False,
+    )
+    window = build_window(
+        qapp,
+        monkeypatch,
+        tmp_path,
+        reasonix_cls=FailingReasonix,
+        settings=settings,
+    )
+    try:
+        assert wait_until(lambda: window._listener.enabled)
+        assert window._startup_check_pending is False
+        assert not window._busy
+        assert "Reasonix 自检失败" not in window.detail_label.text()
+    finally:
+        shutdown_window(window)
 
 def test_non_protocol_clipboard_text_is_ignored(qapp, monkeypatch, tmp_path):
     window = build_window(qapp, monkeypatch, tmp_path)
@@ -419,6 +449,7 @@ def test_model_details_three_layers_shown_in_ui(qapp, monkeypatch, tmp_path):
         openchamber_model="provA/modelA",
         completion_timeout=5.0,
         poll_interval=0.01,
+        auto_compact_after_response=False,  # keeps this test about model details
     )
     window = build_window(
         qapp, monkeypatch, tmp_path, settings=settings, openchamber=oc
@@ -452,148 +483,27 @@ def test_model_details_three_layers_shown_in_ui(qapp, monkeypatch, tmp_path):
         shutdown_window(window)
 
 
-def test_session_refresh_lists_candidates_and_saves_id(qapp, monkeypatch, tmp_path):
-    """The session combo lists existing sessions from the OpenChamber API;
-    selecting one and saving settings stores its id (no auto-create, a
-    free-typed id is kept verbatim, and a re-refresh restores by id — never
-    by the '标题（ses_xxx）' label)."""
-    import ui as ui_mod
-
+def test_save_keeps_preconfigured_fixed_session(qapp, monkeypatch, tmp_path):
+    """The fixed-session UI row is gone; an id persisted in the settings
+    file is kept verbatim by saving (edit the file to change/clear it;
+    empty id = task goes to the currently active OpenChamber session)."""
     from core.relay_settings import RelaySettings
 
-    window = build_window(qapp, monkeypatch, tmp_path)
-    candidates = [
-        ("ses_A", "候选会话A"),
-        ("ses_B", "候选会话B"),
-        ("ses_gone", "已消失会话"),
-    ]
-    monkeypatch.setattr(
-        ui_mod.OpenChamberClient,
-        "list_sessions",
-        lambda self, directory: list(candidates),
-    )
-    try:
-        proj = tmp_path / "proj"
-        proj.mkdir(parents=True, exist_ok=True)
-        window._directory_edit.setText(str(proj))
-        window._refresh_sessions()
-
-        def populated():
-            return window._session_combo.count() == 4  # placeholder + 3
-
-        assert wait_until(populated)
-        combo = window._session_combo
-        assert combo.findData("ses_A") >= 0
-        assert combo.findData("ses_B") >= 0
-
-        # pick a candidate and save: the stored session id is the data value
-        combo.setCurrentIndex(combo.findData("ses_B"))
-        monkeypatch.setattr(RelaySettings, "save", lambda self, path=None: None)
-        window._save_settings()
-        assert window._settings.openchamber_session_id == "ses_B"
-
-        # regression: selecting a titled candidate, then refreshing again,
-        # then saving must still store the REAL id (never the display label)
-        candidates.append(("ses_C", "候选会话C"))
-        window._refresh_sessions()
-
-        def refreshed(count):
-            return (
-                window._session_combo.count() == count
-                and window._session_combo.currentData() == "ses_B"
-            )
-
-        assert wait_until(lambda: refreshed(5))
-        assert combo.currentText() == "候选会话B（ses_B）"
-        window._save_settings()
-        assert window._settings.openchamber_session_id == "ses_B"
-
-        # a free-typed id is preserved across a refresh, not treated as the
-        # selected candidate's label
-        combo.setCurrentText("ses_free_typed")
-        window._refresh_sessions()
-        assert wait_until(lambda: combo.currentText() == "ses_free_typed")
-        window._save_settings()
-        assert window._settings.openchamber_session_id == "ses_free_typed"
-
-        # re-selecting the placeholder clears the id again
-        combo.setCurrentIndex(0)
-        window._save_settings()
-        assert window._settings.openchamber_session_id == ""
-    finally:
-        shutdown_window(window)
-
-
-def test_create_session_button_creates_fixed_session(qapp, monkeypatch, tmp_path):
-    """'新建会话' creates a session through the API, fills the combo with the
-    new id and saves it as the fixed session (same effect as selecting one),"""
-    import ui as ui_mod
-
-    from core.relay_settings import RelaySettings
-
-    created: list[tuple[str, str, str]] = []
-    monkeypatch.setattr(
-        ui_mod.OpenChamberClient,
-        "create_session",
-        lambda self, title, directory: created.append((title, directory))
-        or "ses_new123",
-    )
-    monkeypatch.setattr(RelaySettings, "save", lambda self, path=None: None)
-    window = build_window(qapp, monkeypatch, tmp_path)
-    try:
-        # wait out the startup self-check so _busy is False (busy disables all
-        # execution controls, including the new-session button)
-        assert wait_until(lambda: not window._busy)
-        proj = tmp_path / "proj"
-        proj.mkdir(parents=True, exist_ok=True)
-        window._directory_edit.setText(str(proj))
-        window._create_session()
-
-        def done():
-            return window._session_combo.currentData() == "ses_new123"
-
-        assert wait_until(done)
-        # created against the configured directory with a default title
-        assert created and created[0][1] == str(proj)
-        assert "AI Relay 新建会话" in created[0][0]
-        # and saved as the fixed session, like selecting an existing one
-        assert window._settings.openchamber_session_id == "ses_new123"
-        assert window._session_combo.currentText() == "ses_new123"
-        assert "新会话已创建" in window.status_label.text()
-        assert window._create_session_button.isEnabled()
-    finally:
-        shutdown_window(window)
-
-
-def test_save_session_updates_current_project_mapping(qapp, monkeypatch, tmp_path):
-    from core.relay import directory_key
-    from core.relay_settings import RelaySettings
-
-    settings = RelaySettings(
-        openchamber_directory="D:/proj",
-        openchamber_session_id="ses_old",
-        openchamber_sessions={directory_key("D:/proj"): "ses_old"},
-    )
+    settings = RelaySettings(openchamber_session_id="ses_fixed_in_file")
     window = build_window(qapp, monkeypatch, tmp_path, settings=settings)
     try:
-        window._session_combo.addItem("New session", "ses_new")
-        window._session_combo.setCurrentIndex(
-            window._session_combo.findData("ses_new")
-        )
         monkeypatch.setattr(RelaySettings, "save", lambda self, path=None: None)
-
-        assert window._save_settings()
-        assert window._settings.openchamber_session_id == "ses_new"
-        assert (
-            window._settings.openchamber_sessions[directory_key("D:/proj")]
-            == "ses_new"
-        )
+        assert window._save_settings() is True
+        assert window._settings.openchamber_session_id == "ses_fixed_in_file"
     finally:
         shutdown_window(window)
 
 
 def test_browse_directory_fills_project_path(qapp, monkeypatch, tmp_path):
     import ui as ui_mod
+
+    from core.relay import directory_key
+    from core.relay_settings import RelaySettings
 
     selected = str(tmp_path / "kart-game")
     (tmp_path / "kart-game").mkdir(parents=True, exist_ok=True)
@@ -602,16 +512,16 @@ def test_browse_directory_fills_project_path(qapp, monkeypatch, tmp_path):
         "getExistingDirectory",
         lambda *args: selected,
     )
-    window = build_window(qapp, monkeypatch, tmp_path)
+    # pre-save a fixed session so we can assert it is cleared when the
+    # directory changes
+    settings = RelaySettings(
+        openchamber_session_id="old_ses",
+        openchamber_sessions={directory_key(selected): "old_ses"},
+    )
+    window = build_window(qapp, monkeypatch, tmp_path, settings=settings)
     try:
-        # pre-select a fixed session for the previous directory so we can
-        # assert it is cleared when the directory changes
-        window._session_combo.addItem("old_ses", "old_ses")
-        window._session_combo.setCurrentIndex(
-            window._session_combo.findData("old_ses")
-        )
         # avoid writing the real config on disk during the auto-save and avoid
-        # a real network call during the automatic session refresh
+        # a real network call during the automatic Agent/Model refresh
         monkeypatch.setattr(RelaySettings, "save", lambda self, path=None: None)
         monkeypatch.setattr(
             ui_mod.OpenChamberClient, "list_sessions", lambda self, directory: []
@@ -625,11 +535,11 @@ def test_browse_directory_fills_project_path(qapp, monkeypatch, tmp_path):
         assert os.path.normcase(
             window._settings.openchamber_directory
         ) == os.path.normcase(selected)
-        # stale fixed session cleared
-        assert window._current_session_id() == ""
-        # auto-refreshed the new directory's (empty) session list
-        assert wait_until(
-            lambda: "该项目暂无会话" in window.detail_label.text()
+        # stale fixed session cleared when the directory changes
+        assert window._settings.openchamber_session_id == ""
+        assert (
+            window._settings.openchamber_sessions.get(directory_key(selected))
+            is None
         )
     finally:
         shutdown_window(window)
@@ -685,40 +595,6 @@ def test_startup_selfcheck_hint_shows_when_idle(
             "Reasonix 窗口、输入框和发送按钮均可通过 UIA 识别。"
         )
         assert wait_until(lambda: not window._general_workers)
-    finally:
-        shutdown_window(window)
-
-
-def test_startup_selfcheck_does_not_clobber_session_result(
-    qapp, monkeypatch, tmp_path
-):
-    """Requirement: a session refresh that finished BEFORE the startup
-    self-check may never be overwritten by the self-check hint."""
-    import ui as ui_mod
-
-    window, _stub = _build_with_stub_selfcheck(qapp, monkeypatch, tmp_path, wait=False)
-    monkeypatch.setattr(RelaySettings, "save", lambda self, path=None: None)
-    monkeypatch.setattr(
-        ui_mod.OpenChamberClient,
-        "list_sessions",
-        lambda self, directory: [("ses_1", "项目A")],
-    )
-    try:
-        window._listener.pause()
-        window._directory_edit.setText(str(tmp_path))
-        # start the refresh BEFORE the (still queued) startup self-check takes
-        # the busy flag, so the session result lands first
-        window._refresh_sessions()
-        assert wait_until(
-            lambda: "1 个会话" in window.detail_label.text()
-        ), "refresh result was never written"
-        assert len(StubSelfCheckTask.instances) == 1, "self-check never fired"
-        stub = StubSelfCheckTask.instances[0]
-        stub.succeed()
-        assert "1 个会话" in window.detail_label.text(), (
-            "startup self-check clobbered the session refresh result"
-        )
-        assert "可通过 UIA 识别" not in window.detail_label.text()
     finally:
         shutdown_window(window)
 
@@ -796,143 +672,6 @@ def test_browse_directory_rejects_nonexistent_dir(qapp, monkeypatch, tmp_path):
         assert window._directory_edit.text() == "D:/proj"
         assert window._settings.openchamber_directory == "D:/proj"
         assert "不存在或不是文件夹" in window.detail_label.text()
-    finally:
-        shutdown_window(window)
-
-
-def test_refresh_zero_sessions_shows_hint_not_error(qapp, monkeypatch, tmp_path):
-    import ui as ui_mod
-
-    window = build_window(qapp, monkeypatch, tmp_path)
-    try:
-        window._set_controls_enabled(False)
-        window._sessions_loaded([])
-        assert "该项目暂无会话" in window.detail_label.text()
-        assert "可点击“新建会话”创建" in window.detail_label.text()
-        # not treated as an error
-        assert "错误" not in window.status_label.text()
-    finally:
-        shutdown_window(window)
-
-
-def test_create_session_failure_reports_and_restores_controls(
-    qapp, monkeypatch, tmp_path
-):
-    """A failed '新建会话' must show the error, keep any typed id, and
-    re-enable controls (nothing silently swallowed)."""
-    import ui as ui_mod
-
-    monkeypatch.setattr(
-        ui_mod.OpenChamberClient,
-        "create_session",
-        lambda self, title, directory: (_ for _ in ()).throw(
-            RuntimeError("no endpoint")
-        ),
-    )
-    window = build_window(qapp, monkeypatch, tmp_path)
-    try:
-        assert wait_until(lambda: not window._busy)
-        proj = tmp_path / "proj"
-        proj.mkdir(parents=True, exist_ok=True)
-        window._directory_edit.setText(str(proj))
-        window._create_session()
-
-        def done():
-            return "新建会话失败" in window.detail_label.text()
-
-        assert wait_until(done)
-        assert "no endpoint" in window.detail_label.text()
-        assert window._create_session_button.isEnabled()
-        assert window._save_settings_button.isEnabled()
-    finally:
-        shutdown_window(window)
-
-
-def test_refresh_completion_does_not_unlock_controls_during_task(
-    qapp, monkeypatch, tmp_path
-):
-    """While a refresh is pending a clipboard task may arrive; the refresh
-    success/failure callback must not re-enable execution controls until the
-    task is done (busy-aware restore)."""
-    window = build_window(qapp, monkeypatch, tmp_path)
-    try:
-        # a refresh was started: controls are disabled while the async list
-        # call is in flight, and a task starts executing meanwhile
-        window._set_controls_enabled(False)
-        window._busy = True
-
-        window._sessions_loaded([("ses_A", "候选会话A")])
-
-        def execution_controls_enabled():
-            return any(
-                b.isEnabled()
-                for b in (
-                    window.start_button,
-                    window.pause_button,
-                    window.check_button,
-                    window._save_settings_button,
-                    window._refresh_sessions_button,
-                )
-            )
-
-        assert not execution_controls_enabled()
-
-        # the failure callback must respect the running task as well
-        window._sessions_failed("boom")
-        assert not execution_controls_enabled()
-
-        # once the task has finished, both completion paths unlock again
-        window._busy = False
-        window._sessions_loaded([("ses_A", "候选会话A"), ("ses_B", "候选会话B")])
-        assert execution_controls_enabled()
-
-        window._busy = False
-        window._sessions_failed("boom2")
-        assert execution_controls_enabled()
-    finally:
-        shutdown_window(window)
-
-
-def test_session_refresh_falls_back_to_pathmatching_when_filtered_empty(
-    qapp, monkeypatch, tmp_path
-):
-    """If the server-side ?directory= filter returns nothing even though the
-    project has sessions, the refresh falls back to fetching all sessions and
-    matching by canonical path (case/separator-insensitive), so a valid
-    project is never reported empty."""
-    import ui as ui_mod
-
-    window = build_window(qapp, monkeypatch, tmp_path)
-
-    all_sessions = [
-        ("ses_1", "跑跑卡丁车项目", r"D:\AIwork\跑跑卡丁车"),
-        ("ses_2", "elsewhere", "D:/aiwork/other"),
-    ]
-    monkeypatch.setattr(
-        ui_mod.OpenChamberClient,
-        "list_sessions",
-        lambda self, directory: [],
-    )
-    monkeypatch.setattr(
-        ui_mod.OpenChamberClient,
-        "list_sessions_with_projects",
-        lambda self: list(all_sessions),
-    )
-    try:
-        window._pending_session_id = ""
-        window._session_combo.clear()
-        window._session_combo.addItem("— 未配置会话 —", None)
-        window._session_combo.setCurrentIndex(0)
-        window._directory_edit.setText(r"D:\AIwork\跑跑卡丁车")
-        window._refresh_sessions()
-
-        def populated():
-            return window._session_combo.findData("ses_1") >= 0
-
-        assert wait_until(populated)
-        # only path-matched sessions are listed; the real count is shown
-        assert window._session_combo.findData("ses_2") < 0
-        assert "1 个会话" in window.detail_label.text()
     finally:
         shutdown_window(window)
 
@@ -1366,7 +1105,6 @@ def test_model_rejection_offers_new_session_retry_and_adopts_fresh_session(
 
         assert settings.openchamber_session_id == "ses_new"
         assert settings.openchamber_sessions[directory_key("D:/proj")] == "ses_new"
-        assert window._session_combo.currentData() == "ses_new"
         assert window._workflow.registry.record("task-rej-001")["state"] == "COMPLETED"
     finally:
         shutdown_window(window)
@@ -1428,75 +1166,6 @@ def test_http_400_failure_offers_no_continue(qapp, monkeypatch, tmp_path):
         shutdown_window(window)
 
 
-def test_auto_rotate_controls_defaults_and_toggle_gating(qapp, monkeypatch, tmp_path):
-    """The rotation controls default to off / threshold 5 and the spin + the
-    inheritance check are editable only while the rotation checkbox is on."""
-    window = build_window(qapp, monkeypatch, tmp_path)
-    try:
-        spin = window._auto_rotate_threshold_spin
-        assert window._auto_rotate_check.isChecked() is False
-        assert spin.minimum() == 1
-        assert spin.maximum() == 100
-        assert spin.value() == 5
-        assert spin.isEnabled() is False
-        assert window._auto_rotate_inherit_check.isChecked() is False
-        assert window._auto_rotate_inherit_check.isEnabled() is False
-
-        window._auto_rotate_check.setChecked(True)
-        assert spin.isEnabled() is True
-        assert window._auto_rotate_inherit_check.isEnabled() is True
-
-        window._auto_rotate_check.setChecked(False)
-        assert spin.isEnabled() is False
-        assert window._auto_rotate_inherit_check.isEnabled() is False
-    finally:
-        shutdown_window(window)
-
-
-def test_auto_rotate_toggle_resets_count_and_mirrors_setting(qapp, monkeypatch, tmp_path):
-    from core.relay_settings import RelaySettings
-
-    settings = RelaySettings(auto_rotate_enabled=True, auto_rotate_threshold=2)
-    window = build_window(qapp, monkeypatch, tmp_path, settings=settings)
-    try:
-        assert window._auto_rotate_check.isChecked() is True
-        window._rotation.note_auto_success("D:/proj")
-        assert window._rotation.count("D:/proj") == 1
-
-        # toggling off live-mirrors settings (counting follows the checkbox)
-        # and re-zeroes every project counter
-        window._auto_rotate_check.setChecked(False)
-        assert window._settings.auto_rotate_enabled is False
-        assert window._rotation.count("D:/proj") == 0
-
-        window._auto_rotate_check.setChecked(True)
-        assert window._settings.auto_rotate_enabled is True
-    finally:
-        shutdown_window(window)
-
-
-def test_save_settings_persists_rotation_fields(qapp, monkeypatch, tmp_path):
-    import ui as ui_mod
-
-    from core.relay_settings import RelaySettings
-
-    settings = RelaySettings(
-        openchamber_directory="D:/proj", openchamber_model="4090/qwen3.8-27b"
-    )
-    monkeypatch.setattr(RelaySettings, "save", lambda self, path=None: None)
-    window = build_window(qapp, monkeypatch, tmp_path, settings=settings)
-    try:
-        window._auto_rotate_check.setChecked(True)
-        window._auto_rotate_threshold_spin.setValue(18)
-        window._auto_rotate_inherit_check.setChecked(True)
-        assert window._save_settings() is True
-        assert window._settings.auto_rotate_enabled is True
-        assert window._settings.auto_rotate_threshold == 18
-        assert window._settings.auto_rotate_inherit_auto_accept is True
-    finally:
-        shutdown_window(window)
-
-
 def test_auto_rotation_ignores_reasonix_tasks(qapp, monkeypatch, tmp_path):
     from core.relay_settings import RelaySettings
 
@@ -1549,7 +1218,7 @@ def test_auto_rotation_creates_and_adopts_session_at_threshold(qapp, monkeypatch
         """Every UI-constructed client (rotation worker / session refresh)
         returns the same fresh session id."""
 
-        def __init__(self, url=None, directory="D:/proj"):
+        def __init__(self, url=None, directory="D:/proj", **kwargs):
             super().__init__(directory=directory)
             self.url = url
             self.next_session_id = "ses_rotated1"
@@ -1575,13 +1244,12 @@ def test_auto_rotation_creates_and_adopts_session_at_threshold(qapp, monkeypatch
         window._on_clipboard_text(qapp.clipboard().text())
 
         assert wait_until(
-            lambda: window._session_combo.currentText() == "ses_rotated1"
-        )
-        assert wait_until(
             lambda: window._settings.openchamber_session_id == "ses_rotated1"
         )
+        # rotation success resets the project counter (settings persist
+        # before the UI signal handler runs, so wait for the reset itself)
+        assert wait_until(lambda: window._rotation.count("D:/proj") == 0)
         assert window._settings.openchamber_sessions[key] == "ses_rotated1"
-        assert window._rotation.count("D:/proj") == 0
         assert window.recopy_button.isEnabled()
     finally:
         shutdown_window(window)

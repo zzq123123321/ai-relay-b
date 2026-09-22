@@ -21,6 +21,7 @@ G. Closing the window never starts a queued task (it stays persisted for
 
 from __future__ import annotations
 
+import threading
 import time
 
 import core.relay as relay_mod
@@ -64,6 +65,8 @@ class ControllableRoundOc:
         self.messages_all: list[dict] = []
         self.call_log: list[str] = []
         self.sent_prompts: list[str] = []
+        self.compact_calls: list[tuple[str, str | None]] = []
+        self.compact_gate: threading.Event | None = None
 
     def verify(self) -> None:
         self.call_log.append("verify")
@@ -117,6 +120,15 @@ class ControllableRoundOc:
             )
         )
 
+    def compact(
+        self, session_id: str, directory: str | None = None, model=None
+    ) -> None:
+        """A first-class opencode compaction call (no text prompt)."""
+        self.call_log.append("compact")
+        self.compact_calls.append((session_id, directory))
+        if self.compact_gate is not None and not self.compact_gate.wait(timeout=10):
+            raise OpenChamberUnavailableError("compact gate timed out in test")
+
     def session_status(self, session_id: str, directory: str) -> str:
         if not self.rounds or self.rounds[-1]["done"]:
             return "idle"
@@ -143,11 +155,12 @@ def build_fifo_window(qapp, monkeypatch, tmp_path, task_oc, monitor_fake=None):
         openchamber_sessions={directory_key(str(tmp_path)): "ses_test123"},
         poll_interval=0.05,
         completion_timeout=0,  # no timeout: a busy round waits until completed
+        auto_compact_after_response=False,  # keeps the queue tests about tasks
     )
     monitor_fake = monitor_fake or MutableMessages(
         [completed_reply("a_fq_hist", created=1000, text="history")]
     )
-    monkeypatch.setattr(ui_mod, "OpenChamberClient", lambda url: monitor_fake)
+    monkeypatch.setattr(ui_mod, "OpenChamberClient", lambda url, **kwargs: monitor_fake)
     window = build_window(
         qapp, monkeypatch, tmp_path, settings=settings, openchamber=task_oc
     )
@@ -338,7 +351,7 @@ def test_stale_processing_reconciled_to_completed_on_startup(
     the ORIGINAL task id (never a manual-* id) and handed to side A."""
     qapp.clipboard().clear()
     _seed_stale_processing(tmp_path)
-    monkeypatch.setattr(relay_mod, "OpenChamberClient", lambda url: _ReconcileClient(url))
+    monkeypatch.setattr(relay_mod, "OpenChamberClient", lambda url, **kwargs: _ReconcileClient(url))
     oc = ControllableRoundOc("ses_test123", str(tmp_path), [])
     window = build_fifo_window(qapp, monkeypatch, tmp_path, oc)
     try:
@@ -374,7 +387,7 @@ def test_stale_processing_unreachable_becomes_recovery_required(
     qapp.clipboard().clear()
     _seed_stale_processing(tmp_path)
     monkeypatch.setattr(
-        relay_mod, "OpenChamberClient", lambda url: _ReconcileClient(url, fail=True)
+        relay_mod, "OpenChamberClient", lambda url, **kwargs: _ReconcileClient(url, fail=True)
     )
     oc = ControllableRoundOc("ses_test123", str(tmp_path), [])
     window = build_fifo_window(qapp, monkeypatch, tmp_path, oc)
